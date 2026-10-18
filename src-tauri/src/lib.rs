@@ -425,11 +425,25 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                             }
                         }
                         let error = session.failure;
-                        let transcript = if error.is_some() {
+                        let mut transcript = if error.is_some() {
                             session.visible
                         } else {
                             session.text
                         };
+                        let mut error = error;
+                        if error.is_none() {
+                            let (cleaned, warning) = apply_cleanup(&mut cleaner, &config, transcript.clone());
+                            cleanup_warning = warning;
+                            if cleaned != transcript && session.target != 0 {
+                                app.state::<AppState>().0.lock().unwrap().snapshot.phase =
+                                    "inserting".into();
+                                publish(&app);
+                                if let Err(failure) = insertion::replace_text(session.target, &session.inserted, &cleaned) {
+                                    error = Some(failure);
+                                }
+                            }
+                            transcript = cleaned;
+                        }
                         let state = app.state::<AppState>();
                         let mut backend = state.0.lock().unwrap();
                         backend.snapshot.last_transcript = Some(transcript);
@@ -754,15 +768,13 @@ fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     backend.snapshot.phase = "recording".into();
     backend.snapshot.error = None;
     backend.snapshot.live_transcript = None;
-    if !cleanup_enabled(&backend.snapshot.config) {
-        backend
-            .inference
-            .send(InferenceCommand::StartLive(
-                backend.snapshot.config.clone(),
-                backend.foreground,
-            ))
-            .map_err(|e| e.to_string())?;
-    }
+    backend
+        .inference
+        .send(InferenceCommand::StartLive(
+            backend.snapshot.config.clone(),
+            backend.foreground,
+        ))
+        .map_err(|e| e.to_string())?;
     drop(backend);
     publish(&app);
     Ok(())

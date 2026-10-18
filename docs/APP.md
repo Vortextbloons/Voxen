@@ -247,7 +247,7 @@ Live typing temporarily releases held modifier keys (Ctrl/Shift/Alt/Win), sends 
 
 ## Text cleanup
 
-After batch transcription (and after replacements), Voxen can run an optional cleanup pass with a small local instruction model. Live interim text is never cleaned; only the final transcript is.
+Text appears live while speaking in every cleanup mode. After recording stops, Voxen can clean the final transcript with a small local instruction model and replace the already-typed text. Live interim text is never cleaned; only the final transcript is. If streaming is unavailable, cleanup runs after batch transcription.
 
 | Mode | Effect |
 |------|--------|

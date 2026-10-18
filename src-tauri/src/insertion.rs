@@ -388,6 +388,10 @@ mod windows_insertion {
             assert_eq!(live_edit("hello world", "hello, world"), (6, ", world".into()));
             assert_eq!(live_edit("same", "same"), (0, String::new()));
             assert_eq!(live_edit("surplus", "sur"), (4, String::new()));
+            assert_eq!(
+                live_edit("Um, meet Tuesday, no wait, Wednesday at 4", "Meet Wednesday at 4."),
+                (41, "Meet Wednesday at 4.".into())
+            );
         }
 
         #[test]
@@ -561,6 +565,7 @@ mod windows_insertion {
                     "Hello",
                     "Hello wor",
                     "Hello world",
+                    "Um, Hello world",
                     "Hello, world",
                     "Hello, world ✓ café",
                     "Hello, world ✓ café 😀",
