@@ -1,0 +1,26 @@
+{
+  "name": "voxen",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6",
+    "@tauri-apps/cli": "^2",
+    "svelte": "^5",
+    "svelte-check": "^4",
+    "typescript": "^5",
+    "vite": "^7"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
