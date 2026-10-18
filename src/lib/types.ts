@@ -1,5 +1,7 @@
 export type ActivationMode = 'hold' | 'toggle';
 
+export type CleanupMode = 'raw' | 'light' | 'polished';
+
 export type Phase = 'idle' | 'recording' | 'transcribing' | 'inserting' | 'error';
 
 export interface Replacement {
@@ -16,6 +18,9 @@ export interface Config {
 	device: string;
 	replacements: Replacement[];
 	unloadAfterSeconds: number;
+	cleanupMode: CleanupMode;
+	cleanupRuntimePath: string;
+	cleanupModelPath: string;
 }
 
 export interface AppSnapshot {

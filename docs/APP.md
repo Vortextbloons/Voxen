@@ -38,6 +38,7 @@ Voxen is a **local Windows dictation** desktop app. You hold or toggle a global 
 | Live interim text in target app while speaking | Yes (Windows; see [Live dictation](#live-dictation)) |
 | Clipboard backup and restore | Yes (batch paste path) |
 | Phrase replacements | Yes |
+| Text cleanup (Raw / Light / Polished, local model) | Yes |
 | System tray while settings closed | Yes |
 | On-screen dictation indicator | Yes |
 | Sidebar live transcript preview | Yes (`liveTranscript`) |
@@ -46,7 +47,6 @@ Voxen is a **local Windows dictation** desktop app. You hold or toggle a global 
 | Streaming UI in other apps | No (live typing uses keystrokes, not app APIs) |
 | Launch at login | Planned |
 | ASR vocabulary boosting | Planned |
-| Filler-word cleanup / cleanup LLM | Planned |
 | macOS / Linux | Not supported |
 
 The **release milestone** is: shortcut → capture → local transcription → insertion. Everything in the “Planned” row is explicitly later work.
@@ -122,6 +122,9 @@ Fields (camelCase in JSON):
 | `device` | string | `vulkan:0` | `cpu` or `vulkan:<index>` |
 | `replacements` | `{ from, to }[]` | `[]` | Literal substring replace on transcript (not regex); applied in array order; empty `from` rows are skipped at runtime but rejected on save |
 | `unloadAfterSeconds` | number | `300` | Idle unload delay; max 86400; `0` = never auto-unload |
+| `cleanupMode` | `"raw"` \| `"light"` \| `"polished"` | `"raw"` | Post-transcription cleanup pass; `raw` skips it |
+| `cleanupRuntimePath` | string | `""` | `llama-server` binary or the folder containing it; required unless mode is `raw` |
+| `cleanupModelPath` | string | `""` | Small local instruction GGUF for cleanup; required unless mode is `raw` |
 
 Validation highlights:
 
@@ -142,7 +145,10 @@ Validation highlights:
   "replacements": [
     { "from": "voxen", "to": "Voxen" }
   ],
-  "unloadAfterSeconds": 300
+  "unloadAfterSeconds": 300,
+  "cleanupMode": "raw",
+  "cleanupRuntimePath": "",
+  "cleanupModelPath": ""
 }
 ```
 
@@ -236,6 +242,27 @@ During **recording**, Voxen tries to run NeMo’s **streaming** ASR in parallel 
 Live typing temporarily releases held modifier keys (Ctrl/Shift/Alt/Win), sends keystrokes, then restores modifiers so shortcut chords do not block insertion.
 
 **Test microphone** uses the same pipeline but with `foreground = 0`, so you see `liveTranscript` / `lastTranscript` in the sidebar only.
+
+---
+
+## Text cleanup
+
+After batch transcription (and after replacements), Voxen can run an optional cleanup pass with a small local instruction model. Live interim text is never cleaned; only the final transcript is.
+
+| Mode | Effect |
+|------|--------|
+| `raw` | No cleanup; transcript is kept unchanged |
+| `light` | Remove only the filler interjections um/uh and resolve an adjacent same-sentence self-correction (`Tuesday, no wait, Wednesday` → `Wednesday`) |
+| `polished` | Light cleanup plus punctuation, capitalization, sentence splits, and numbered-list markers only when every listed word is kept and no conjunction is dropped |
+
+**Runtime:** Voxen manages a warm local `llama-server` child process (no FFI, no cloud, localhost only). The server starts lazily on the first cleanup with a fixed 2048-token context, reasoning disabled, and greedy decoding, using the configured port only. It makes a single bounded startup attempt (60s); a failed start keeps the original transcript and reports an error. A running server is reused across utterances with no per-call model poll, and stopped when settings are saved, the model is unloaded, or Voxen exits. Changing the cleanup runtime or model path unloads the previous server.
+
+**Pinned setup (verified October 18, 2026):** `llama-server` from the llama.cpp Vulkan backend (2.51.0) with `Qwen3.5-0.8B` rejected as too weak (it either echoed fillers or dropped hedging) and `Qwen3.5-2B-Q4_K_S` (~1.2 GB) pinned instead: it removes fillers, resolves adjacent corrections, and preserves names, numbers, negations, and commands. Set:
+
+- **Cleanup runtime path** — `llama-server.exe` or its folder, e.g. the LM Studio backend folder `llama.cpp-win-x86_64-vulkan-avx2-2.51.0`
+- **Cleanup model path** — e.g. `Qwen3.5-2B-Q4_K_S.gguf`
+
+**Safety guard:** every model reply passes an ordered lexical check before it replaces the transcript. Only clear um/uh deletions, narrow comma-delimited edge fillers (er/ah/basically), single-word adjacent same-sentence self-correction resolutions, punctuation/case changes, and numbered-list markers are allowed, and fillers may only be removed, never added; ambiguous phrases (you know, sort of, kind of, like), sentence-initial So, names (Ah, Er), conjunctions (and/or), negations, numbers, symbols, paths, and commands are preserved exactly, including hyphens, slashes, dots, and other symbols inside words. Any other added, dropped, or swapped word (added fillers, extra negations, changed numbers, swapped names or days, cross-sentence or trailing-cue corrections, truncation, hallucinations) rejects the reply. Rejected and failed cleanups keep the original transcript and show a warning in the sidebar (`Cleanup kept the original transcript: …`). Requests are bounded to 2000 input characters with a 30-second timeout; over-long or cut-off replies are rejected the same way.
 
 ---
 
@@ -362,6 +389,7 @@ The same `index.html` serves the main window and the indicator via query string.
 |--------|------|
 | `src-tauri/src/lib.rs` | Tauri app, workers, config, commands |
 | `src-tauri/src/nemo.rs` | Dynamic load of `nemo_speech_asr_c.dll`, C ABI bindings, transcribe |
+| `src-tauri/src/cleanup.rs` | Managed `llama-server` child process, bounded chat requests, lexical safety guard |
 | `src-tauri/src/insertion.rs` | Windows `insert_text` (clipboard + Ctrl+V) and `replace_text` (live Unicode keystrokes) |
 
 ### Tauri IPC commands
@@ -514,6 +542,7 @@ See [AGENTS.md](../AGENTS.md) for editing principles (minimal diffs, no drive-by
 | `empty_replacements_are_rejected_and_cannot_expand_text` | `lib.rs` | Save validation and runtime skip for empty `from` |
 | `transcribing_and_inserting_block_new_recordings` | `lib.rs` | `is_available` only allows `idle` and `error` |
 | `live_edits_only_replace_the_changed_suffix` | `insertion.rs` | Common-prefix logic for live typing |
+| `cleanup` guard tests | `cleanup.rs` | Clear-filler/correction acceptance; conjunction, symbol/number, ambiguous-filler, name, negation, day-swap, cross-sentence-correction, truncation, and hallucination rejection |
 | `live_edits_keep_whole_surrogate_pairs` | `insertion.rs` | Unicode surrogate-safe backspace boundaries |
 
 ### Opt-in integration tests
@@ -523,7 +552,10 @@ Require local runtime, model, GPU, or interactive clipboard:
 ```powershell
 $env:VOXEN_RUNTIME = (Resolve-Path runtime/nemo-speech-0.2.0-windows-x86_64-vulkan).Path
 $env:VOXEN_MODEL = 'C:\path\to\parakeet-tdt-0.6b-v3.q8_0.gguf'
+$env:VOXEN_CLEANUP_RUNTIME = 'C:\path\to\llama.cpp-win-x86_64-vulkan-avx2-2.51.0'
+$env:VOXEN_CLEANUP_MODEL = 'C:\path\to\Qwen3.5-2B-Q4_K_S.gguf'
 cargo test --manifest-path src-tauri/Cargo.toml real_runtime_transcribes_sample -- --ignored
+cargo test --manifest-path src-tauri/Cargo.toml real_runtime_cleans_spoken_text -- --ignored
 cargo test --manifest-path src-tauri/Cargo.toml real_runtime_streams_sample_incrementally -- --ignored
 cargo test --manifest-path src-tauri/Cargo.toml rich_and_empty_clipboards_are_restored -- --ignored
 cargo test --manifest-path src-tauri/Cargo.toml paste_reaches_a_windows_edit_control -- --ignored
@@ -543,7 +575,7 @@ Documented verification (October 18, 2026) on the primary dev machine: Vulkan + 
 - Audio samples exist in RAM during capture and inference; they are not written to disk by Voxen.
 - Transcripts live in memory (`lastTranscript` in snapshot) until replaced or the app exits.
 - Settings file contains paths and preferences only, not audio.
-- No network calls are required for dictation once runtime and model are local.
+- No network calls are required for dictation once runtime and model are local. Text cleanup talks only to a `llama-server` child process on localhost.
 
 ---
 
@@ -560,6 +592,9 @@ Documented verification (October 18, 2026) on the primary dev machine: Vulkan + 
 | Garbled or duplicated live text | Target app handles keys differently | Try another editor; batch fallback applies only if streaming never started |
 | Clipboard not restored | Target consumed clipboard (sequence number changed) | Expected for some apps; backup skipped intentionally |
 | Model slow first time, fast after | Cold load vs resident recognizer | Lower **Unload model after** or set `0`; use **Unload model** to free RAM |
+| *llama-server was not found…* | Wrong cleanup runtime path | Point at `llama-server.exe` or its folder; keep the backend DLLs together |
+| *The cleanup model was not found* | Wrong cleanup model path | Point at the local GGUF file |
+| *Cleanup kept the original transcript…* | Guard rejected the model reply (or the request timed out) | Original text was preserved; try Light mode or a shorter utterance |
 | Settings invalid on startup | Hand-edited `config.json` | Fix JSON/values in UI and save again |
 
 ---
@@ -582,13 +617,11 @@ Not implemented yet; listed for context:
 - Launch at login
 - ASR vocabulary boosting
 - Persisted dictation history
-- Filler-word removal
 - Further streaming polish (non–text-field apps, latency tuning)
-- Post-processing / cleanup LLM
 - Application-specific formatting
 - Performance tuning beyond current idle model retention
 
-Phrase replacements and offline local inference are the main post-processing surface today.
+Phrase replacements, offline local inference, and the local text cleanup pass are the main post-processing surface today.
 
 ---
 

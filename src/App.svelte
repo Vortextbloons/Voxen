@@ -335,6 +335,36 @@
 					</section>
 
 					<section class="group">
+						<h2>Text cleanup</h2>
+						<p class="intro">Optional second pass over every transcription with a small local model. If cleanup fails or rewrites too much, the original transcript is kept and a warning appears in the sidebar.</p>
+						<fieldset class="field">
+							<legend>Mode</legend>
+							<label class="choice">
+								<input type="radio" name="cleanupMode" value="raw" bind:group={draft.cleanupMode} />
+								<span>Raw<small>Keep the transcript unchanged.</small></span>
+							</label>
+							<label class="choice">
+								<input type="radio" name="cleanupMode" value="light" bind:group={draft.cleanupMode} />
+								<span>Light<small>Remove fillers and resolve self-corrections, keep every other word.</small></span>
+							</label>
+							<label class="choice">
+								<input type="radio" name="cleanupMode" value="polished" bind:group={draft.cleanupMode} />
+								<span>Polished<small>Light cleanup plus punctuation, capitalization, and lists.</small></span>
+							</label>
+						</fieldset>
+						<div class="field">
+							<label for="cleanupRuntimePath">Cleanup runtime path</label>
+							<input id="cleanupRuntimePath" type="text" bind:value={draft.cleanupRuntimePath} />
+							<p class="hint">Path to llama-server.exe or the folder containing it.</p>
+						</div>
+						<div class="field">
+							<label for="cleanupModelPath">Cleanup model path</label>
+							<input id="cleanupModelPath" type="text" bind:value={draft.cleanupModelPath} />
+							<p class="hint">Path to a small local instruction model file, for example Qwen3.5-2B-Q4_K_S.gguf.</p>
+						</div>
+					</section>
+
+					<section class="group">
 						<h2>Replacements</h2>
 						<p class="intro">Words or phrases replaced automatically in every transcription.</p>
 						<Replacements bind:replacements={draft.replacements} />

@@ -1,3 +1,4 @@
+mod cleanup;
 #[cfg(target_os = "windows")]
 mod insertion;
 mod nemo;
@@ -27,6 +28,12 @@ struct Config {
     device: String,
     replacements: Vec<Replacement>,
     unload_after_seconds: u64,
+    #[serde(default)]
+    cleanup_mode: cleanup::Mode,
+    #[serde(default)]
+    cleanup_runtime_path: String,
+    #[serde(default)]
+    cleanup_model_path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -85,6 +92,48 @@ fn default_config() -> Config {
         device: "vulkan:0".into(),
         replacements: vec![],
         unload_after_seconds: 300,
+        cleanup_mode: cleanup::Mode::Raw,
+        cleanup_runtime_path: String::new(),
+        cleanup_model_path: String::new(),
+    }
+}
+
+fn cleanup_enabled(config: &Config) -> bool {
+    config.cleanup_mode != cleanup::Mode::Raw
+        && !config.cleanup_runtime_path.trim().is_empty()
+        && !config.cleanup_model_path.trim().is_empty()
+}
+
+fn apply_cleanup(
+    cleaner: &mut Option<cleanup::Cleaner>,
+    config: &Config,
+    text: String,
+) -> (String, Option<String>) {
+    if !cleanup_enabled(config) || text.trim().is_empty() {
+        return (text, None);
+    }
+    let stale = cleaner.as_ref().is_some_and(|active| {
+        !active.matches(&config.cleanup_runtime_path, &config.cleanup_model_path)
+    });
+    if stale {
+        *cleaner = None;
+    }
+    if cleaner.is_none() {
+        match cleanup::Cleaner::load(&config.cleanup_runtime_path, &config.cleanup_model_path) {
+            Ok(loaded) => *cleaner = Some(loaded),
+            Err(error) => return (text, Some(format!("Cleanup is unavailable: {error}"))),
+        }
+    }
+    match cleaner
+        .as_mut()
+        .unwrap()
+        .clean(text.trim(), config.cleanup_mode)
+    {
+        Ok(cleaned) => (cleaned, None),
+        Err(error) => (
+            text,
+            Some(format!("Cleanup kept the original transcript: {error}")),
+        ),
     }
 }
 
@@ -312,6 +361,7 @@ fn append_mono(target: &Arc<Mutex<Vec<f32>>>, data: impl Iterator<Item = f32>, c
 
 fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) {
     let mut model: Option<nemo::Recognizer> = None;
+    let mut cleaner: Option<cleanup::Cleaner> = None;
     let mut deadline: Option<Instant> = None;
     let mut live: Option<Live> = None;
     loop {
@@ -332,6 +382,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
             InferenceCommand::Unload => {
                 live = None;
                 model = None;
+                cleaner = None;
                 deadline = None;
                 app.state::<AppState>()
                     .0
@@ -364,6 +415,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                 }
             }
             InferenceCommand::Transcribe(config, samples, rate, foreground) => {
+                let mut cleanup_warning: Option<String> = None;
                 let result = (|| {
                     if let Some(mut session) = live.take() {
                         if session.failure.is_none() {
@@ -405,6 +457,8 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     }
                     let text = model.as_mut().unwrap().transcribe(&samples, rate)?;
                     let text = apply_replacements(text, &config.replacements);
+                    let (text, warning) = apply_cleanup(&mut cleaner, &config, text);
+                    cleanup_warning = warning;
                     app.state::<AppState>()
                         .0
                         .lock()
@@ -430,7 +484,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                         let state = app.state::<AppState>();
                         let mut backend = state.0.lock().unwrap();
                         backend.snapshot.phase = "idle".into();
-                        backend.snapshot.error = None;
+                        backend.snapshot.error = cleanup_warning;
                         drop(backend);
                         publish(&app);
                     }
@@ -554,6 +608,12 @@ fn validate_config(config: &Config) -> Result<Shortcut, String> {
         .any(|replacement| replacement.from.is_empty())
     {
         return Err("Replacement source phrases cannot be empty".into());
+    }
+    if config.cleanup_mode != cleanup::Mode::Raw
+        && (config.cleanup_runtime_path.trim().is_empty()
+            || config.cleanup_model_path.trim().is_empty())
+    {
+        return Err("Set the cleanup runtime and model paths, or choose the Raw mode".into());
     }
     config
         .shortcut
@@ -694,13 +754,15 @@ fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     backend.snapshot.phase = "recording".into();
     backend.snapshot.error = None;
     backend.snapshot.live_transcript = None;
-    backend
-        .inference
-        .send(InferenceCommand::StartLive(
-            backend.snapshot.config.clone(),
-            backend.foreground,
-        ))
-        .map_err(|e| e.to_string())?;
+    if !cleanup_enabled(&backend.snapshot.config) {
+        backend
+            .inference
+            .send(InferenceCommand::StartLive(
+                backend.snapshot.config.clone(),
+                backend.foreground,
+            ))
+            .map_err(|e| e.to_string())?;
+    }
     drop(backend);
     publish(&app);
     Ok(())
@@ -879,5 +941,36 @@ mod tests {
         assert!(!is_available("inserting"));
         assert!(!is_available("recording"));
         assert!(is_available("error"));
+    }
+
+    #[test]
+    fn cleanup_requires_a_mode_and_both_paths() {
+        let mut config = default_config();
+        config.cleanup_runtime_path = "C:\\runtime".into();
+        config.cleanup_model_path = "C:\\cleanup.gguf".into();
+        assert!(!cleanup_enabled(&config));
+        config.cleanup_mode = cleanup::Mode::Light;
+        assert!(cleanup_enabled(&config));
+        config.cleanup_model_path = String::new();
+        assert!(!cleanup_enabled(&config));
+    }
+
+    #[test]
+    fn selecting_a_cleanup_mode_requires_cleanup_paths() {
+        let mut config = default_config();
+        config.cleanup_mode = cleanup::Mode::Polished;
+        assert!(validate_config(&config).is_err());
+        config.cleanup_runtime_path = "C:\\runtime".into();
+        config.cleanup_model_path = "C:\\cleanup.gguf".into();
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn cleanup_preserves_the_original_when_disabled_or_empty() {
+        let mut cleaner = None;
+        let config = default_config();
+        let (text, warning) = apply_cleanup(&mut cleaner, &config, "hello there".into());
+        assert_eq!(text, "hello there");
+        assert_eq!(warning, None);
     }
 }

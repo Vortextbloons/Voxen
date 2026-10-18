@@ -27,6 +27,10 @@ Download the pinned model once with the included CLI:
 
 The CLI prints the resulting local GGUF path. Set that path and the absolute path to `bin/nemo_speech_asr_c.dll` in Voxen's settings. Use `vulkan:0` for the RX 9060 XT on this machine. Runtime and model downloads are setup steps; dictation itself works offline. The model has a [CC-BY-4.0 license](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
 
+## Text cleanup setup
+
+Cleanup is optional and off by default (`raw` mode). It needs a `llama-server` binary and a small instruction model on disk — both stay local. Verified with the llama.cpp 2.51.0 Vulkan backend and `Qwen3.5-2B-Q4_K_S.gguf` (the smaller Qwen3.5-0.8B proved too weak: it echoed fillers or dropped hedging). In Voxen's settings choose **Light** or **Polished**, set the cleanup runtime path to `llama-server.exe` (or its folder) and the cleanup model path to the GGUF file, then save. If a cleanup reply rewrites too much, the original transcript is kept and a warning appears in the sidebar.
+
 ## First-use check
 
 1. Save the local runtime/model paths and choose a microphone.
@@ -46,7 +50,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The release milestone is shortcut → capture → local transcription → insertion. Launch at login, ASR vocabulary boosting, persisted history, filler-word cleanup, streaming, a cleanup LLM, application-specific formatting, and performance tuning are later work. Phrase replacements are available now; transcripts are retained only in RAM.
+The release milestone is shortcut → capture → local transcription → insertion. Launch at login, ASR vocabulary boosting, persisted history, application-specific formatting, and performance tuning are later work. Phrase replacements and the optional local text cleanup pass are available now; transcripts are retained only in RAM.
 
 The settings window closes completely while dictation stays available in the system tray. Choose **Settings** from the tray menu to reopen it, or **Quit** to stop Voxen. The **Test microphone** button keeps its result in the settings window; global dictation inserts into the original foreground application. If you switch applications before insertion, Voxen keeps the transcript and reports the focus change.
 
