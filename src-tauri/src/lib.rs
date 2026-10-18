@@ -44,6 +44,7 @@ struct Backend {
     audio: mpsc::Sender<AudioCommand>,
     inference: mpsc::Sender<InferenceCommand>,
     foreground: isize,
+    shortcut_capture: bool,
 }
 
 struct AppState(Mutex<Backend>);
@@ -400,6 +401,25 @@ fn list_microphones() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
+fn set_shortcut_capture(app: AppHandle, state: State<'_, AppState>, active: bool) -> Result<(), String> {
+    let mut backend = state.0.lock().unwrap();
+    if backend.shortcut_capture == active { return Ok(()); }
+    if active && !is_available(&backend.snapshot.phase) {
+        return Err("Wait until dictation finishes before changing the shortcut".into());
+    }
+    let shortcut = backend.snapshot.config.shortcut.parse::<Shortcut>().map_err(|error| error.to_string())?;
+    if active {
+        if app.global_shortcut().is_registered(shortcut) {
+            app.global_shortcut().unregister(shortcut).map_err(|error| error.to_string())?;
+        }
+    } else if !app.global_shortcut().is_registered(shortcut) {
+        app.global_shortcut().register(shortcut).map_err(|error| error.to_string())?;
+    }
+    backend.shortcut_capture = active;
+    Ok(())
+}
+
+#[tauri::command]
 fn save_config(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -409,6 +429,9 @@ fn save_config(
     let mut backend = state.0.lock().unwrap();
     if !is_available(&backend.snapshot.phase) {
         return Err("Wait until dictation finishes before changing settings".into());
+    }
+    if backend.shortcut_capture {
+        return Err("Finish selecting the shortcut before saving".into());
     }
     let old_shortcut = backend
         .snapshot
@@ -570,6 +593,7 @@ pub fn run() {
         .manage(IndicatorState(Mutex::new(())))
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
             let state = app.state::<AppState>();
+            if state.0.lock().unwrap().shortcut_capture { return; }
             let (mode, phase) = { let backend = state.0.lock().unwrap(); (backend.snapshot.config.activation_mode.clone(), backend.snapshot.phase.clone()) };
             let result = match (mode.as_str(), event.state) {
                 ("hold", ShortcutState::Pressed) if is_available(&phase) => start_recording(app.clone(), state),
@@ -580,7 +604,7 @@ pub fn run() {
             };
             if let Err(error) = result { report_error(app, error); }
         }).build())
-        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0 })))
+        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false })))
         .setup(move |app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || audio_worker(handle, audio_rx, audio_tx));
@@ -615,6 +639,12 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
+                if matches!(event, tauri::WindowEvent::Focused(false) | tauri::WindowEvent::CloseRequested { .. }) {
+                    let app = window.app_handle();
+                    if let Err(error) = set_shortcut_capture(app.clone(), app.state::<AppState>(), false) {
+                        report_error(app, error);
+                    }
+                }
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let window = window.clone();
@@ -622,7 +652,7 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_snapshot, list_microphones, save_config, start_recording, stop_recording, unload_model])
+        .invoke_handler(tauri::generate_handler![get_snapshot, list_microphones, save_config, set_shortcut_capture, start_recording, stop_recording, unload_model])
         .build(tauri::generate_context!())
         .expect("error while building Voxen")
         .run(|_, event| {

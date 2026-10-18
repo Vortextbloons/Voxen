@@ -5,6 +5,7 @@
 		getSnapshot,
 		listMicrophones,
 		saveConfig,
+		setShortcutCapture,
 		startRecording,
 		stopRecording,
 		unloadModel,
@@ -25,6 +26,70 @@
 	let saveError = $state<string | null>(null);
 	let actionError = $state<string | null>(null);
 	let busyAction = $state<'start' | 'stop' | 'unload' | null>(null);
+	let shortcutCapturing = $state(false);
+	let shortcutPreparing = $state(false);
+	let shortcutChosen = $state(false);
+	let previousShortcut = '';
+	let shortcutCaptureRequest: Promise<void> | undefined;
+
+	async function beginShortcutCapture(event: FocusEvent) {
+		if (!draft) return;
+		const input = event.currentTarget as HTMLInputElement;
+		previousShortcut = draft.shortcut;
+		shortcutChosen = false;
+		shortcutPreparing = true;
+		actionError = null;
+		shortcutCaptureRequest = setShortcutCapture(true);
+		try {
+			await shortcutCaptureRequest;
+			shortcutCapturing = document.activeElement === input;
+		} catch (error) {
+			actionError = errorMessage(error);
+		} finally {
+			shortcutPreparing = false;
+		}
+	}
+
+	async function endShortcutCapture() {
+		shortcutCapturing = false;
+		if (!shortcutCaptureRequest) return;
+		try {
+			await shortcutCaptureRequest;
+			await setShortcutCapture(false);
+		} catch (error) {
+			actionError = errorMessage(error);
+		} finally {
+			shortcutCaptureRequest = undefined;
+		}
+	}
+
+	function captureShortcut(event: KeyboardEvent) {
+		if (event.key === 'Tab') return;
+		event.preventDefault();
+		if (!draft || !shortcutCapturing || event.repeat || event.isComposing) return;
+		const input = event.currentTarget as HTMLInputElement;
+		if (event.key === 'Escape') {
+			draft.shortcut = previousShortcut;
+			input.blur();
+			return;
+		}
+		if (!event.code || ['Control', 'Shift', 'Alt', 'Meta', 'AltGraph'].includes(event.key)) return;
+		const keys = [];
+		if (event.ctrlKey) keys.push('Ctrl');
+		if (event.altKey) keys.push('Alt');
+		if (event.shiftKey) keys.push('Shift');
+		if (event.metaKey) keys.push('Super');
+		keys.push(event.code.replace(/^(Key|Digit)/, ''));
+		draft.shortcut = keys.join('+');
+		shortcutChosen = true;
+		saved = false;
+	}
+
+	function releaseShortcut(event: KeyboardEvent) {
+		if (shortcutChosen && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+			(event.currentTarget as HTMLInputElement).blur();
+		}
+	}
 
 	function toDraft(config: Config): Config {
 		return {
@@ -117,6 +182,7 @@
 	async function save(event: SubmitEvent) {
 		event.preventDefault();
 		if (!draft) return;
+		await endShortcutCapture();
 		saving = true;
 		saved = false;
 		saveError = null;
@@ -137,6 +203,10 @@
 		}
 	}
 </script>
+
+<svelte:window onblur={() => {
+	if (shortcutCaptureRequest) (document.getElementById('shortcut') as HTMLInputElement | null)?.blur();
+}} />
 
 {#if indicatorMode}
 	<Indicator />
@@ -207,8 +277,12 @@
 						<h2>Activation</h2>
 						<div class="field">
 							<label for="shortcut">Shortcut</label>
-							<input id="shortcut" type="text" bind:value={draft.shortcut} placeholder="Ctrl+Shift+Space" />
-							<p class="hint">Global shortcut used to start and stop dictation.</p>
+							<input id="shortcut" type="text" readonly
+								value={shortcutPreparing ? 'Preparing...' : shortcutCapturing && !shortcutChosen ? 'Press your shortcut...' : draft.shortcut}
+								aria-describedby="shortcut-hint"
+								onfocus={beginShortcutCapture} onblur={endShortcutCapture}
+								onkeydown={captureShortcut} onkeyup={releaseShortcut} />
+							<p id="shortcut-hint" class="hint">Click the field and press your shortcut. Release the keys, then save. Esc cancels.</p>
 						</div>
 						<fieldset class="field">
 							<legend>Mode</legend>

@@ -16,6 +16,10 @@ export function saveConfig(config: Config): Promise<AppSnapshot> {
 	return invoke<AppSnapshot>('save_config', { config });
 }
 
+export function setShortcutCapture(active: boolean): Promise<void> {
+	return invoke('set_shortcut_capture', { active });
+}
+
 export function startRecording(): Promise<void> {
 	return invoke('start_recording');
 }
