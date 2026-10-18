@@ -2,6 +2,8 @@
 
 Local Windows dictation with Svelte 5, Tauri 2, Rust, and Parakeet TDT v3 through the NeMo-Speech.cpp C ABI. Audio stays in RAM and recognition runs inside the app. There is no transcription server or Python runtime.
 
+Full application reference: [docs/APP.md](docs/APP.md).
+
 ## Development
 
 Install Node.js, Rust with the MSVC toolchain, Visual Studio C++ Build Tools, and WebView2. Then run:

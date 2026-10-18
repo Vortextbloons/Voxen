@@ -23,6 +23,7 @@ export interface AppSnapshot {
 	phase: Phase;
 	error: string | null;
 	lastTranscript: string | null;
+	liveTranscript: string | null;
 	modelLoaded: boolean;
 }
 

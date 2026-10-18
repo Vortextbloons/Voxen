@@ -20,7 +20,7 @@ mod windows_insertion {
         UI::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+                KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
             },
             WindowsAndMessaging::{GetForegroundWindow, IsWindow},
         },
@@ -269,9 +269,133 @@ mod windows_insertion {
         }
     }
 
+    fn unicode_input(unit: u16, key_up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: if key_up {
+                        KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                    } else {
+                        KEYEVENTF_UNICODE
+                    },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    fn send_inputs(inputs: &[INPUT]) -> Result<(), String> {
+        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            return Err("Windows accepted only part of the live keystrokes".into());
+        }
+        Ok(())
+    }
+
+    fn send_key(key: u16, key_up: bool) -> Result<(), String> {
+        send_inputs(&[key_input(key, key_up)])
+    }
+
+    fn held_modifiers() -> Vec<u16> {
+        [0x10, 0x11, 0x12, 0x5b, 0x5c, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5]
+            .into_iter()
+            .filter(|key| unsafe { GetAsyncKeyState(*key) } < 0)
+            .map(|key| key as u16)
+            .collect()
+    }
+
+    fn backspace(count: usize) -> Result<(), String> {
+        const BATCH: usize = 32;
+        let mut remaining = count;
+        while remaining > 0 {
+            let batch = remaining.min(BATCH);
+            let mut inputs = Vec::with_capacity(batch * 2);
+            for _ in 0..batch {
+                inputs.push(key_input(0x08, false));
+                inputs.push(key_input(0x08, true));
+            }
+            send_inputs(&inputs)?;
+            remaining -= batch;
+        }
+        Ok(())
+    }
+
+    fn type_unicode(text: &str) -> Result<(), String> {
+        const BATCH: usize = 32;
+        let units: Vec<u16> = text.encode_utf16().collect();
+        for chunk in units.chunks(BATCH) {
+            let mut inputs = Vec::with_capacity(chunk.len() * 2);
+            for unit in chunk {
+                inputs.push(unicode_input(*unit, false));
+                inputs.push(unicode_input(*unit, true));
+            }
+            send_inputs(&inputs)?;
+        }
+        Ok(())
+    }
+
+    fn live_edit(previous: &str, next: &str) -> (usize, String) {
+        let previous: Vec<char> = previous.chars().collect();
+        let next: Vec<char> = next.chars().collect();
+        let shared = previous
+            .iter()
+            .zip(next.iter())
+            .take_while(|(before, after)| before == after)
+            .count();
+        (previous.len() - shared, next[shared..].iter().collect())
+    }
+
+    pub fn replace_text(foreground: isize, previous: &str, next: &str) -> Result<(), String> {
+        let hwnd = HWND(foreground as *mut _);
+        ensure_original_foreground(hwnd)?;
+        let (deletes, inserted) = live_edit(previous, next);
+        if deletes == 0 && inserted.is_empty() {
+            return Ok(());
+        }
+
+        let modifiers = held_modifiers();
+        for key in &modifiers {
+            send_key(*key, true)?;
+        }
+        let typed = (|| {
+            ensure_original_foreground(hwnd)?;
+            backspace(deletes)?;
+            type_unicode(&inserted)
+        })();
+        let restored = modifiers
+            .iter()
+            .rev()
+            .try_for_each(|key| send_key(*key, false));
+        match (typed, restored) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn live_edits_only_replace_the_changed_suffix() {
+            assert_eq!(live_edit("", "hello"), (0, "hello".into()));
+            assert_eq!(live_edit("hello", "hello world"), (0, " world".into()));
+            assert_eq!(live_edit("hello world", "hello, world"), (6, ", world".into()));
+            assert_eq!(live_edit("same", "same"), (0, String::new()));
+            assert_eq!(live_edit("surplus", "sur"), (4, String::new()));
+        }
+
+        #[test]
+        fn live_edits_keep_whole_surrogate_pairs() {
+            assert_eq!(live_edit("a😀", "a😁"), (1, "😁".into()));
+            assert_eq!(live_edit("a😀b", "a😁b"), (2, "😁b".into()));
+            assert_eq!(live_edit("😀", "😀 done"), (0, " done".into()));
+        }
 
         #[test]
         #[ignore]
@@ -385,13 +509,108 @@ mod windows_insertion {
             let length = unsafe { GetWindowTextW(window, &mut text) } as usize;
             assert!(String::from_utf16_lossy(&text[..length]).contains("Voxen paste ✓"));
         }
+
+        #[test]
+        #[ignore]
+        fn live_typing_revises_unicode_without_duplicating() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowTextW, PeekMessageW,
+                SetForegroundWindow, TranslateMessage, MSG, PM_REMOVE, WINDOW_EX_STYLE,
+                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            };
+            let previous = unsafe { GetForegroundWindow() };
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    windows::core::w!("EDIT"),
+                    windows::core::w!(""),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    100,
+                    100,
+                    480,
+                    180,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+            struct TestWindow(HWND, HWND);
+            impl Drop for TestWindow {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = DestroyWindow(self.0);
+                        let _ = SetForegroundWindow(self.1);
+                    }
+                }
+            }
+            let _window = TestWindow(window, previous);
+            unsafe {
+                let _ = SetForegroundWindow(window);
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(window);
+            }
+            assert_eq!(unsafe { GetForegroundWindow() }, window);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let target = window.0 as isize;
+            thread::spawn(move || {
+                let mut result = send_key(0x11, false).and_then(|()| send_key(0x10, false));
+                let mut typed = "";
+                for next in [
+                    "Hel",
+                    "Hello",
+                    "Hello wor",
+                    "Hello world",
+                    "Hello, world",
+                    "Hello, world ✓ café",
+                    "Hello, world ✓ café 😀",
+                    "Hello, world ✓ café 😀",
+                ] {
+                    if result.is_err() {
+                        break;
+                    }
+                    result = replace_text(target, typed, next);
+                    typed = next;
+                }
+                let _ = send_key(0x10, true);
+                let _ = send_key(0x11, true);
+                let _ = sender.send(result);
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = loop {
+                let mut message = MSG::default();
+                while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() } {
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                if let Ok(result) = receiver.try_recv() {
+                    break result;
+                }
+                assert!(Instant::now() < deadline, "Live typing did not complete");
+                thread::sleep(Duration::from_millis(5));
+            };
+            result.unwrap();
+            let mut text = [0u16; 128];
+            let length = unsafe { GetWindowTextW(window, &mut text) } as usize;
+            assert_eq!(
+                String::from_utf16_lossy(&text[..length]),
+                "Hello, world ✓ café 😀"
+            );
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_insertion::insert_text;
+pub use windows_insertion::{insert_text, replace_text};
 
 #[cfg(not(target_os = "windows"))]
 pub fn insert_text(_: isize, _: &str) -> Result<(), String> {
+    Err("Text insertion is supported on Windows only".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn replace_text(_: isize, _: &str, _: &str) -> Result<(), String> {
     Err("Text insertion is supported on Windows only".into())
 }

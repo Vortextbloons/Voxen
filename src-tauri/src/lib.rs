@@ -36,6 +36,7 @@ struct AppSnapshot {
     phase: String,
     error: Option<String>,
     last_transcript: Option<String>,
+    live_transcript: Option<String>,
     model_loaded: bool,
 }
 
@@ -60,6 +61,18 @@ enum AudioCommand {
 enum InferenceCommand {
     Transcribe(Config, Vec<f32>, u32, isize),
     Unload,
+    StartLive(Config, isize),
+    LiveAudio(Vec<f32>, u32),
+}
+
+struct Live {
+    stream: nemo::Stream,
+    replacements: Vec<Replacement>,
+    target: isize,
+    text: String,
+    visible: String,
+    inserted: String,
+    failure: Option<String>,
 }
 
 fn default_config() -> Config {
@@ -143,13 +156,27 @@ fn audio_worker(
     app: AppHandle,
     receiver: mpsc::Receiver<AudioCommand>,
     sender: mpsc::Sender<AudioCommand>,
+    inference: mpsc::Sender<InferenceCommand>,
 ) {
     let mut stream: Option<cpal::Stream> = None;
     let mut samples = Arc::new(Mutex::new(Vec::<f32>::new()));
     let mut rate = 0;
-    while let Ok(command) = receiver.recv() {
+    let mut forwarded = 0;
+    loop {
+        let command = if stream.is_some() {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match receiver.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            }
+        };
         match command {
-            AudioCommand::Start(name, reply) => {
+            Some(AudioCommand::Start(name, reply)) => {
                 let result = (|| {
                     let host = cpal::default_host();
                     let device = match name.as_deref().filter(|name| !name.is_empty()) {
@@ -216,6 +243,7 @@ fn audio_worker(
                 match result {
                     Ok(active) => {
                         stream = Some(active);
+                        forwarded = 0;
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
@@ -223,22 +251,48 @@ fn audio_worker(
                     }
                 }
             }
-            AudioCommand::Stop(reply) => {
+            Some(AudioCommand::Stop(reply)) => {
                 if stream.take().is_none() {
                     let _ = reply.send(Err("Recording is not active".into()));
                 } else {
+                    forward_audio(&inference, &samples, &mut forwarded, rate);
                     let captured = std::mem::take(&mut *samples.lock().unwrap());
+                    forwarded = 0;
                     let _ = reply.send(Ok((captured, rate)));
                 }
             }
-            AudioCommand::Failed(error) => {
+            Some(AudioCommand::Failed(error)) => {
                 if stream.take().is_some() {
                     samples.lock().unwrap().clear();
+                    forwarded = 0;
                     report_error(&app, error);
+                }
+            }
+            None => {
+                if stream.is_some() {
+                    forward_audio(&inference, &samples, &mut forwarded, rate);
                 }
             }
         }
     }
+}
+
+fn forward_audio(
+    inference: &mpsc::Sender<InferenceCommand>,
+    samples: &Arc<Mutex<Vec<f32>>>,
+    forwarded: &mut usize,
+    rate: u32,
+) {
+    let chunk = {
+        let captured = samples.lock().unwrap();
+        if captured.len() <= *forwarded {
+            return;
+        }
+        let chunk = captured[*forwarded..].to_vec();
+        *forwarded = captured.len();
+        chunk
+    };
+    let _ = inference.send(InferenceCommand::LiveAudio(chunk, rate));
 }
 
 fn append_mono(target: &Arc<Mutex<Vec<f32>>>, data: impl Iterator<Item = f32>, channels: usize) {
@@ -259,6 +313,7 @@ fn append_mono(target: &Arc<Mutex<Vec<f32>>>, data: impl Iterator<Item = f32>, c
 fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) {
     let mut model: Option<nemo::Recognizer> = None;
     let mut deadline: Option<Instant> = None;
+    let mut live: Option<Live> = None;
     loop {
         let command = match deadline {
             Some(until) => {
@@ -275,6 +330,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
         };
         match command {
             InferenceCommand::Unload => {
+                live = None;
                 model = None;
                 deadline = None;
                 app.state::<AppState>()
@@ -285,8 +341,54 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     .model_loaded = false;
                 publish(&app);
             }
+            InferenceCommand::StartLive(config, target) => {
+                live = None;
+                deadline = None;
+                match start_live(&app, &mut model, &config, target) {
+                    Ok(session) => live = Some(session),
+                    Err(error) => {
+                        app.state::<AppState>().0.lock().unwrap().snapshot.error =
+                            Some(format!("Live typing is unavailable: {error}"));
+                        publish(&app);
+                    }
+                }
+            }
+            InferenceCommand::LiveAudio(samples, rate) => {
+                if let Some(session) = live.as_mut() {
+                    if session.failure.is_none() {
+                        match session.stream.push(&samples, rate) {
+                            Ok(()) => pump_live(&app, session),
+                            Err(error) => session.failure = Some(error),
+                        }
+                    }
+                }
+            }
             InferenceCommand::Transcribe(config, samples, rate, foreground) => {
                 let result = (|| {
+                    if let Some(mut session) = live.take() {
+                        if session.failure.is_none() {
+                            match session.stream.finish() {
+                                Ok(()) => pump_live(&app, &mut session),
+                                Err(error) => session.failure = Some(error),
+                            }
+                        }
+                        let error = session.failure;
+                        let transcript = if error.is_some() {
+                            session.visible
+                        } else {
+                            session.text
+                        };
+                        let state = app.state::<AppState>();
+                        let mut backend = state.0.lock().unwrap();
+                        backend.snapshot.last_transcript = Some(transcript);
+                        backend.snapshot.live_transcript = None;
+                        drop(backend);
+                        publish(&app);
+                        return match error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
+                    }
                     if model.is_none() {
                         model = Some(nemo::Recognizer::load(
                             &config.runtime_path,
@@ -337,6 +439,82 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
             }
         }
     }
+}
+
+fn start_live(
+    app: &AppHandle,
+    model: &mut Option<nemo::Recognizer>,
+    config: &Config,
+    target: isize,
+) -> Result<Live, String> {
+    if model.is_none() {
+        *model = Some(nemo::Recognizer::load(
+            &config.runtime_path,
+            &config.model_path,
+            &config.device,
+        )?);
+        app.state::<AppState>()
+            .0
+            .lock()
+            .unwrap()
+            .snapshot
+            .model_loaded = true;
+        publish(app);
+    }
+    Ok(Live {
+        stream: model.as_ref().unwrap().stream()?,
+        replacements: config.replacements.clone(),
+        target,
+        text: String::new(),
+        visible: String::new(),
+        inserted: String::new(),
+        failure: None,
+    })
+}
+
+fn pump_live(app: &AppHandle, session: &mut Live) {
+    loop {
+        match session.stream.next() {
+            Ok(Some((transcript, is_final))) => {
+                apply_live(app, session, transcript, is_final);
+                if session.failure.is_some() {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                session.failure = Some(error);
+                break;
+            }
+        }
+    }
+}
+
+fn apply_live(app: &AppHandle, session: &mut Live, transcript: String, is_final: bool) {
+    let transcript = apply_replacements(transcript, &session.replacements);
+    if is_final {
+        if !session.text.is_empty() && !transcript.is_empty() {
+            session.text.push(' ');
+        }
+        session.text.push_str(&transcript);
+    }
+    let mut visible = session.text.clone();
+    if !is_final && !transcript.is_empty() {
+        if !visible.is_empty() {
+            visible.push(' ');
+        }
+        visible.push_str(&transcript);
+    }
+    if session.target != 0 {
+        match insertion::replace_text(session.target, &session.inserted, &visible) {
+            Ok(()) => session.inserted = visible.clone(),
+            Err(error) => session.failure = Some(error),
+        }
+    }
+    session.visible = visible;
+    app.state::<AppState>().0.lock().unwrap().snapshot.live_transcript =
+        (!session.visible.is_empty()).then_some(session.visible.clone());
+    publish(app);
 }
 
 fn apply_replacements(text: String, replacements: &[Replacement]) -> String {
@@ -515,6 +693,14 @@ fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     rx.recv().map_err(|e| e.to_string())??;
     backend.snapshot.phase = "recording".into();
     backend.snapshot.error = None;
+    backend.snapshot.live_transcript = None;
+    backend
+        .inference
+        .send(InferenceCommand::StartLive(
+            backend.snapshot.config.clone(),
+            backend.foreground,
+        ))
+        .map_err(|e| e.to_string())?;
     drop(backend);
     publish(&app);
     Ok(())
@@ -585,10 +771,12 @@ pub fn run() {
         phase: "idle".into(),
         error: None,
         last_transcript: None,
+        live_transcript: None,
         model_loaded: false,
     };
     let (audio_tx, audio_rx) = mpsc::channel();
     let (inference_tx, inference_rx) = mpsc::channel();
+    let audio_inference = inference_tx.clone();
     tauri::Builder::default()
         .manage(IndicatorState(Mutex::new(())))
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
@@ -607,7 +795,7 @@ pub fn run() {
         .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false })))
         .setup(move |app| {
             let handle = app.handle().clone();
-            std::thread::spawn(move || audio_worker(handle, audio_rx, audio_tx));
+            std::thread::spawn(move || audio_worker(handle, audio_rx, audio_tx, audio_inference));
             let handle = app.handle().clone();
             std::thread::spawn(move || inference_worker(handle, inference_rx));
             if let Ok(directory) = app.path().app_config_dir() {

@@ -247,6 +247,12 @@
 			{#if actionError}
 				<p class="error" role="alert">{actionError}</p>
 			{/if}
+			{#if appState.snapshot?.liveTranscript}
+				<section class="transcript">
+					<h2>Live</h2>
+					<p>{appState.snapshot.liveTranscript}</p>
+				</section>
+			{/if}
 			{#if appState.snapshot?.lastTranscript}
 				<section class="transcript">
 					<h2>Last transcription</h2>
