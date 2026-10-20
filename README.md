@@ -1,75 +1,180 @@
-# Voxen
+<div align="center">
 
-Local Windows dictation with Svelte 5, Tauri 2, Rust, and Parakeet TDT v3 through the NeMo-Speech.cpp C ABI. Audio stays in RAM and recognition runs inside the app. There is no transcription server or Python runtime.
+<table>
+<tr>
+<td align="center" style="background: linear-gradient(160deg, #1a2d5c 0%, #142343 35%, #0a1228 70%, #080F25 100%); border: 1px solid #5789FF40; border-radius: 24px; padding: 52px 32px 44px; box-shadow: 0 24px 80px #080F2566;">
 
-Full application reference: [docs/APP.md](docs/APP.md).
+<table cellpadding="0" cellspacing="0" style="margin: 0 auto 20px;">
+<tr>
+<td align="center" style="padding: 6px; border-radius: 52px; background: linear-gradient(135deg, #16C9FF55, #5789FF44, #A42DFF55);">
+<img src="src-tauri/icons/icon.svg" width="168" height="168" alt="Voxen" style="display: block; border-radius: 44px; box-shadow: 0 12px 40px #16C9FF33, 0 0 0 1px #FFFFFF12 inset;" />
+</td>
+</tr>
+</table>
 
-## Development
+<h1 style="margin: 0 0 6px; font-size: 3em; letter-spacing: -0.03em; line-height: 1.1;">
+  <span style="color: #FFFFFF;">Vox</span><span style="color: #16C9FF;">en</span>
+</h1>
 
-Install Node.js, Rust with the MSVC toolchain, Visual Studio C++ Build Tools, and WebView2. Then run:
+<p style="margin: 0 0 22px; font-size: 1.15em; font-weight: 500; color: #CBD9FF; letter-spacing: 0.02em;">
+  Speak anywhere you type.
+</p>
 
-```powershell
-npm install
-npm run tauri dev
+<p style="margin: 0 auto 28px; max-width: 580px; color: #9EB0E0; line-height: 1.6; font-size: 0.98em;">
+  A lightweight <strong style="color: #E8EEFF;">Windows dictation</strong> app — global shortcut, local speech recognition, and your words land in whatever already has focus.
+</p>
+
+<p style="margin: 0;">
+  <img src="https://img.shields.io/badge/Platform-Windows-142343?style=for-the-badge&logo=windows&logoColor=white" alt="Windows" />
+  &nbsp;
+  <img src="https://img.shields.io/badge/STT-Local_on_device-16C9FF?style=for-the-badge&logo=cpu&logoColor=142343" alt="Local STT" />
+  &nbsp;
+  <img src="https://img.shields.io/badge/Cloud-None-5789FF?style=for-the-badge&logo=shield&logoColor=white" alt="No cloud" />
+  &nbsp;
+  <img src="https://img.shields.io/badge/Stack-Tauri_·_Rust-A42DFF?style=for-the-badge&logo=tauri&logoColor=white" alt="Tauri + Rust" />
+</p>
+
+</td>
+</tr>
+</table>
+
+<br />
+
+<table width="100%">
+<tr>
+<td align="center" width="32%" style="padding: 18px 14px; border-radius: 16px; background: linear-gradient(180deg, #142343 0%, #101a35 100%); border: 1px solid #16C9FF35;">
+  <div style="font-size: 1.5em; margin-bottom: 6px;">🎙️</div>
+  <strong style="color: #16C9FF;">Hold or toggle</strong><br />
+  <span style="color: #8FA4D8; font-size: 0.88em;">Your shortcut, your mode</span>
+</td>
+<td width="2%"></td>
+<td align="center" width="32%" style="padding: 18px 14px; border-radius: 16px; background: linear-gradient(180deg, #142343 0%, #101a35 100%); border: 1px solid #5789FF35;">
+  <div style="font-size: 1.5em; margin-bottom: 6px;">🔒</div>
+  <strong style="color: #5789FF;">On-device STT</strong><br />
+  <span style="color: #8FA4D8; font-size: 0.88em;">Audio stays on your machine</span>
+</td>
+<td width="2%"></td>
+<td align="center" width="32%" style="padding: 18px 14px; border-radius: 16px; background: linear-gradient(180deg, #142343 0%, #101a35 100%); border: 1px solid #A42DFF35;">
+  <div style="font-size: 1.5em; margin-bottom: 6px;">⚡</div>
+  <strong style="color: #C77DFF;">Tray-first</strong><br />
+  <span style="color: #8FA4D8; font-size: 0.88em;">Minimal UI until you need settings</span>
+</td>
+</tr>
+</table>
+
+</div>
+
+<br />
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+  A["🖱️ Focus any app"] --> B["⌨️ Global shortcut"]
+  B --> C["🎙️ Speak"]
+  C --> D["📝 Text at cursor"]
+  D --> E["✨ Optional local polish"]
+  style A fill:#142343,stroke:#16C9FF,color:#fff
+  style B fill:#142343,stroke:#5789FF,color:#fff
+  style C fill:#142343,stroke:#16C9FF,color:#fff
+  style D fill:#142343,stroke:#5789FF,color:#fff
+  style E fill:#080F25,stroke:#A42DFF,color:#CBD9FF
 ```
 
-`npm run dev` opens only the browser UI; microphone capture and global shortcuts require the native Tauri application.
+<table width="100%">
+<tr>
+<td width="50%" valign="top" style="padding: 8px 20px 8px 0;">
 
-## Local model setup
+### Getting started
 
-Download the Windows Vulkan archive from the [NeMo-Speech.cpp v0.2.0 release](https://github.com/NVIDIA/NeMo-Speech.cpp/releases/tag/v0.2.0), verify its published SHA-256, and extract the whole archive. Keep its DLLs together. The development copy is under `runtime/nemo-speech-0.2.0-windows-x86_64-vulkan`.
+1. Put the cursor where you want text.
+2. **Hold** the shortcut to talk, or **toggle** it on and off in Settings.
+3. When you stop, Voxen inserts the transcript there.
 
-Download the pinned model once with the included CLI:
+Optional cleanup can lightly polish wording with a small **local** model — **off by default**.
 
-```powershell
-& './runtime/nemo-speech-0.2.0-windows-x86_64-vulkan/bin/nemo-speech.exe' pull parakeet-tdt
-```
+</td>
+<td width="50%" valign="top" style="padding: 8px 0 8px 24px; border-left: 2px solid #5789FF28;">
 
-The CLI prints the resulting local GGUF path. Set that path and the absolute path to `bin/nemo_speech_asr_c.dll` in Voxen's settings. Use `vulkan:0` for the RX 9060 XT on this machine. Runtime and model downloads are setup steps; dictation itself works offline. The model has a [CC-BY-4.0 license](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
+### Scope
 
-## Text cleanup setup
+Voxen is intentionally small: shortcut dictation, local speech recognition, and a few optional tweaks — not accounts, sync, saved history, or a full voice assistant.
 
-Cleanup is optional and off by default (`raw` mode). It needs a `llama-server` binary and a small instruction model on disk — both stay local. Verified with the llama.cpp 2.51.0 Vulkan backend and `Qwen3.5-2B-Q4_K_S.gguf` (the smaller Qwen3.5-0.8B proved too weak: it echoed fillers or dropped hedging). In Voxen's settings choose **Light** or **Polished**, set the cleanup runtime path to `llama-server.exe` (or its folder) and the cleanup model path to the GGUF file, then save. If a cleanup reply rewrites too much, the original transcript is kept and a warning appears in the sidebar. Spoken numbers and model codes are normalized by a built-in deterministic pass that needs no setup (`M Five` → `M5`, `ninety nine fifty X` → `9950X`, `fifty eighty` → `5080`) and runs in every mode.
+| | |
+|---|---|
+| ✅ | Global hotkey, tray, local models |
+| ❌ | Cloud transcription, voice commands, history |
 
-## First-use check
+**Windows only** for now. Microphone, shortcut, and model setup live in **Settings**.
 
-1. Save the local runtime/model paths and choose a microphone.
-2. Open Notepad and place the cursor in a document.
-3. Press the configured global shortcut, speak, and release it in hold mode; press again to stop in toggle mode.
-4. Check that the transcript appears in the original application and that the clipboard is restored.
-5. Repeat in a browser, Discord, and VS Code before relying on it for everyday use.
+</td>
+</tr>
+</table>
 
-Windows input injection cannot reliably target applications running at a higher privilege level. Run the app and target editor at the same privilege level. Clipboard restoration and application paste timing need interactive testing across those applications.
+---
 
-## Checks
+<div align="center">
 
-```powershell
-npm run check
-npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
-```
+<table width="100%">
+<tr>
+<td align="center" width="33%" style="padding: 22px 12px; vertical-align: top; border-radius: 14px; background: #F8FAFF;">
 
-The release milestone is shortcut → capture → local transcription → insertion. Launch at login, ASR vocabulary boosting, persisted history, application-specific formatting, and performance tuning are later work. Phrase replacements, automatic spoken-number normalization, and the optional local text cleanup pass are available now; transcripts are retained only in RAM.
+<div style="font-size: 2em; margin-bottom: 8px;">⚡</div>
 
-The settings window closes completely while dictation stays available in the system tray. Choose **Settings** from the tray menu to reopen it, or **Quit** to stop Voxen. The **Test microphone** button keeps its result in the settings window; global dictation inserts into the original foreground application. If you switch applications before insertion, Voxen keeps the transcript and reports the focus change.
+**Fast**
 
-The recognizer stays resident between utterances. Set the idle timeout to `0` to retain it, or use **Unload model** to free its memory. NeMo 0.2.0's DLLs stay loaded until Voxen exits because unloading and reloading them caused a native runtime failure during verification; model memory is still freed. Restart Voxen before replacing runtime DLLs.
+<p style="margin: 8px 0 0; color: #5a6b8a; font-size: 0.9em;">
+Global shortcut, minimal chrome, tray when you need it
+</p>
 
-## Local inference verification
+</td>
+<td width="2%"></td>
+<td align="center" width="33%" style="padding: 22px 12px; vertical-align: top; border-radius: 14px; background: #F8FAFF;">
 
-On October 18, 2026, NeMo-Speech.cpp 0.2.0 reported a compatible Vulkan runtime and the RX 9060 XT as device 0. Its pinned Parakeet Q8 model successfully transcribed the upstream 11-second JFK sample. A second CLI invocation took 1.40 seconds including process startup and model loading. This is a single sample, not an app latency benchmark or a microphone-to-paste test.
+<div style="font-size: 2em; margin-bottom: 8px;">🔐</div>
 
-The app's C ABI test also passed punctuation/capitalization, repeated inference, and model destruction/reload on Vulkan0. Native app checks passed microphone enumeration/capture, hold shortcut release, changing the shortcut, toggle mode, and timed model unloading. Windows tests passed rich/Unicode/empty clipboard restoration and actual `SendInput` paste into a Windows edit control. Cross-application checks in Discord, VS Code, and browsers still need interactive testing with spoken dictation.
+**Private**
 
-Hardware and clipboard tests are opt-in because they require the local runtime, GPU, or clipboard:
+<p style="margin: 8px 0 0; color: #5a6b8a; font-size: 0.9em;">
+Recognition on your machine — no cloud transcription
+</p>
 
-```powershell
-$env:VOXEN_RUNTIME = (Resolve-Path runtime/nemo-speech-0.2.0-windows-x86_64-vulkan).Path
-$env:VOXEN_MODEL = 'C:\path\to\parakeet-tdt-0.6b-v3.q8_0.gguf'
-cargo test --manifest-path src-tauri/Cargo.toml real_runtime_transcribes_sample -- --ignored
-cargo test --manifest-path src-tauri/Cargo.toml rich_and_empty_clipboards_are_restored -- --ignored
-cargo test --manifest-path src-tauri/Cargo.toml paste_reaches_a_windows_edit_control -- --ignored
-```
+</td>
+<td width="2%"></td>
+<td align="center" width="33%" style="padding: 22px 12px; vertical-align: top; border-radius: 14px; background: #F8FAFF;">
 
-Build the Windows installer with `npm run tauri build -- --bundles nsis`. Model and runtime assets are external and are not embedded in the installer. This development machine already has the verified runtime under `runtime/` and the pinned model in `%LOCALAPPDATA%\NeMoSpeech\models`.
+<div style="font-size: 2em; margin-bottom: 8px;">🎯</div>
+
+**Focused**
+
+<p style="margin: 8px 0 0; color: #5a6b8a; font-size: 0.9em;">
+Dictation into the app that already has focus
+</p>
+
+</td>
+</tr>
+</table>
+
+<br />
+
+<table>
+<tr>
+<td align="center" style="padding: 16px 28px; border-radius: 14px; background: linear-gradient(135deg, #142343 0%, #1a2d5c 100%); border: 1px solid #5789FF33;">
+<span style="color: #CBD9FF; font-size: 0.92em;"><strong style="color: #16C9FF;">Goal</strong> — fast, private voice input with almost no UI. Settings and a tray icon when you need them; otherwise it stays out of the way.</span>
+</td>
+</tr>
+</table>
+
+<br />
+
+<a href="docs/APP.md">
+  <img src="https://img.shields.io/badge/Documentation-Setup_&_dev_guide-16C9FF?style=for-the-badge&logo=readthedocs&logoColor=142343" alt="Documentation" />
+</a>
+
+<br /><br />
+
+<sub style="color: #8899bb;">Svelte 5 · Tauri 2 · Rust · Parakeet TDT v3 · NeMo-Speech.cpp</sub>
+
+</div>

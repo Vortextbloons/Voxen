@@ -1,12 +1,14 @@
 mod cleanup;
-#[cfg(target_os = "windows")]
 mod insertion;
 mod nemo;
 mod normalize;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -55,6 +57,48 @@ struct Backend {
     foreground: isize,
     shortcut_capture: bool,
     start_cancelled: bool,
+    cancellation: Option<Cancellation>,
+    submission: Option<insertion::SubmissionObserver>,
+}
+
+impl Backend {
+    fn finish_session(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.finish();
+        }
+        drop(self.submission.take());
+    }
+}
+
+#[derive(Clone)]
+struct Cancellation {
+    cancelled: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Cancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
 }
 
 struct AppState(Mutex<Backend>);
@@ -69,10 +113,10 @@ enum AudioCommand {
 }
 
 enum InferenceCommand {
-    Transcribe(Config, Vec<f32>, u32, isize),
+    Transcribe(Config, Vec<f32>, u32, isize, Cancellation),
     Unload,
     UnloadCleanup,
-    StartLive(Config, isize),
+    StartLive(Config, isize, Cancellation),
     LiveAudio(Vec<f32>, u32),
 }
 
@@ -84,6 +128,7 @@ struct Live {
     visible: String,
     inserted: String,
     failure: Option<String>,
+    cancellation: Cancellation,
 }
 
 fn default_config() -> Config {
@@ -348,6 +393,11 @@ fn audio_worker(
                 if stream.take().is_some() {
                     samples.lock().unwrap().clear();
                     forwarded = 0;
+                    {
+                        let state = app.state::<AppState>();
+                        let mut backend = state.0.lock().unwrap();
+                        backend.finish_session();
+                    }
                     report_error(&app, error);
                 }
             }
@@ -437,10 +487,10 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                 cleaner = None;
                 deadline = None;
             }
-            InferenceCommand::StartLive(config, target) => {
+            InferenceCommand::StartLive(config, target, cancellation) => {
                 live = None;
                 deadline = None;
-                match start_live(&app, &mut model, &config, target) {
+                match start_live(&app, &mut model, &config, target, cancellation) {
                     Ok(session) => live = Some(session),
                     Err(error) => {
                         app.state::<AppState>().0.lock().unwrap().snapshot.error =
@@ -459,7 +509,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     }
                 }
             }
-            InferenceCommand::Transcribe(config, samples, rate, foreground) => {
+            InferenceCommand::Transcribe(config, samples, rate, foreground, cancellation) => {
                 let mut cleanup_warning: Option<String> = None;
                 let result = (|| {
                     if let Some(mut session) = live.take() {
@@ -480,11 +530,19 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                             let (cleaned, warning) = apply_cleanup(&mut cleaner, &config, transcript.clone());
                             cleanup_warning = warning;
                             let cleaned = normalize::normalize(&cleaned);
-                            if cleaned != transcript && session.target != 0 {
+                            if cleaned != transcript
+                                && session.target != 0
+                                && !session.cancellation.is_cancelled()
+                            {
                                 app.state::<AppState>().0.lock().unwrap().snapshot.phase =
                                     "inserting".into();
                                 publish(&app);
-                                if let Err(failure) = insertion::replace_text(session.target, &session.inserted, &cleaned) {
+                                if let Err(failure) = insertion::replace_text(
+                                    session.target,
+                                    &session.inserted,
+                                    &cleaned,
+                                    &session.cancellation,
+                                ) {
                                     error = Some(failure);
                                 }
                             }
@@ -526,15 +584,23 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                         .unwrap()
                         .snapshot
                         .last_transcript = Some(text.clone());
-                    if !text.trim().is_empty() && foreground != 0 {
+                    if !text.trim().is_empty()
+                        && foreground != 0
+                        && !cancellation.is_cancelled()
+                    {
                         app.state::<AppState>().0.lock().unwrap().snapshot.phase =
                             "inserting".into();
                         publish(&app);
                         #[cfg(target_os = "windows")]
-                        insertion::insert_text(foreground, &text)?;
+                        insertion::insert_text(foreground, &text, &cancellation)?;
                     }
                     Ok::<(), String>(())
                 })();
+                {
+                    let state = app.state::<AppState>();
+                    let mut backend = state.0.lock().unwrap();
+                    backend.finish_session();
+                }
                 unload_model_on_idle = config.unload_after_seconds > 0;
                 deadline = if model.is_some() && (unload_model_on_idle || cleaner.is_some()) {
                     let idle = if unload_model_on_idle {
@@ -567,6 +633,7 @@ fn start_live(
     model: &mut Option<nemo::Recognizer>,
     config: &Config,
     target: isize,
+    cancellation: Cancellation,
 ) -> Result<Live, String> {
     if model.is_none() {
         *model = Some(nemo::Recognizer::load(
@@ -590,6 +657,7 @@ fn start_live(
         visible: String::new(),
         inserted: String::new(),
         failure: None,
+        cancellation,
     })
 }
 
@@ -626,8 +694,13 @@ fn apply_live(app: &AppHandle, session: &mut Live, transcript: String, is_final:
         }
         visible.push_str(&transcript);
     }
-    if session.target != 0 {
-        match insertion::replace_text(session.target, &session.inserted, &visible) {
+    if session.target != 0 && !session.cancellation.is_cancelled() {
+        match insertion::replace_text(
+            session.target,
+            &session.inserted,
+            &visible,
+            &session.cancellation,
+        ) {
             Ok(()) => session.inserted = visible.clone(),
             Err(error) => session.failure = Some(error),
         }
@@ -700,9 +773,15 @@ fn complete_start(
         }
         let completion = apply_start_completion(&mut backend, result);
         if completion == StartCompletion::Listening {
-            let _ = backend
-                .inference
-                .send(InferenceCommand::StartLive(config, foreground));
+            if let Some(cancellation) = backend.cancellation.clone() {
+                let _ = backend.inference.send(InferenceCommand::StartLive(
+                    config,
+                    foreground,
+                    cancellation,
+                ));
+            }
+        } else {
+            backend.finish_session();
         }
     }
     publish(&app);
@@ -868,13 +947,33 @@ fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
             }
         }
         let (tx, rx) = mpsc::channel();
+        backend.finish_session();
+        let cancellation = Cancellation::new();
+        let submission = if backend.foreground != 0 {
+            match insertion::SubmissionObserver::install(backend.foreground, &cancellation) {
+                Ok(observer) => Some(observer),
+                Err(error) => {
+                    cancellation.finish();
+                    return Err(format!(
+                        "Keyboard submission protection unavailable: {error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         backend
             .audio
             .send(AudioCommand::Start(
                 backend.snapshot.config.microphone.clone(),
                 tx,
             ))
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| {
+                cancellation.finish();
+                error.to_string()
+            })?;
+        backend.cancellation = Some(cancellation);
+        backend.submission = submission;
         backend.start_cancelled = false;
         backend.snapshot.phase = "starting".into();
         backend.snapshot.error = None;
@@ -902,28 +1001,43 @@ fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
     if backend.snapshot.phase != "recording" {
         return Err("Recording is not active".into());
     }
-    let (tx, rx) = mpsc::channel();
-    backend
-        .audio
-        .send(AudioCommand::Stop(tx))
-        .map_err(|e| e.to_string())?;
-    let (samples, rate) = rx.recv().map_err(|e| e.to_string())??;
-    backend.snapshot.phase = "transcribing".into();
-    let job = InferenceCommand::Transcribe(
-        backend.snapshot.config.clone(),
-        samples,
-        rate,
-        backend.foreground,
-    );
+    let cancellation = backend
+        .cancellation
+        .clone()
+        .ok_or_else(|| "Recording is not active".to_string())?;
+    let job = (|| {
+        let (tx, rx) = mpsc::channel();
+        backend
+            .audio
+            .send(AudioCommand::Stop(tx))
+            .map_err(|e| e.to_string())?;
+        let (samples, rate) = rx.recv().map_err(|e| e.to_string())??;
+        backend.snapshot.phase = "transcribing".into();
+        Ok::<InferenceCommand, String>(InferenceCommand::Transcribe(
+            backend.snapshot.config.clone(),
+            samples,
+            rate,
+            backend.foreground,
+            cancellation.clone(),
+        ))
+    })();
+    let job = match job {
+        Ok(job) => job,
+        Err(error) => {
+            backend.finish_session();
+            return Err(error);
+        }
+    };
     drop(backend);
     publish(&app);
-    state
-        .0
-        .lock()
-        .unwrap()
-        .inference
-        .send(job)
-        .map_err(|e| e.to_string())
+    let result = state.0.lock().unwrap().inference.send(job);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            state.0.lock().unwrap().finish_session();
+            Err(error.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -982,7 +1096,7 @@ pub fn run() {
             };
             if let Err(error) = result { report_error(app, error); }
         }).build())
-        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false, start_cancelled: false })))
+        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false, start_cancelled: false, cancellation: None, submission: None })))
         .setup(move |app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || audio_worker(handle, audio_rx, audio_tx, audio_inference));
@@ -1101,6 +1215,8 @@ mod tests {
             foreground: 0,
             shortcut_capture: false,
             start_cancelled: false,
+            cancellation: None,
+            submission: None,
         }
     }
 
@@ -1114,6 +1230,17 @@ mod tests {
         );
         assert_eq!(backend.snapshot.phase, "idle");
         assert!(backend.snapshot.error.is_none());
+    }
+
+    #[test]
+    fn cancellation_is_scoped_to_one_dictation_session() {
+        let first = Cancellation::new();
+        let second = Cancellation::new();
+        first.cancel();
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        second.finish();
+        assert!(!first.is_finished());
     }
 
     #[test]

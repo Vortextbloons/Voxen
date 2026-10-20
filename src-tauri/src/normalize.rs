@@ -67,6 +67,13 @@ struct Run<'a> {
     trail: &'a str,
 }
 
+struct Decimal<'a> {
+    text: String,
+    end: usize,
+    lead: &'a str,
+    trail: &'a str,
+}
+
 pub fn normalize(text: &str) -> String {
     let (tokens, tail) = tokenize(text);
     if tokens.is_empty() {
@@ -78,7 +85,27 @@ pub fn normalize(text: &str) -> String {
     while index < tokens.len() {
         let token = &tokens[index];
         let lower = token.core.to_lowercase();
+        if let Some(decimal) = read_decimal(&tokens, index) {
+            out.push_str(token.ws);
+            out.push_str(decimal.lead);
+            out.push_str(&decimal.text);
+            out.push_str(decimal.trail);
+            index = decimal.end;
+            continue;
+        }
         if BRAND_PREFIXES.contains(&lower.as_str()) && token.trail.is_empty() {
+            if let Some(decimal) = read_decimal(&tokens, index + 1) {
+                if !blocked(&tokens, index, decimal.end) {
+                    out.push_str(token.ws);
+                    out.push_str(token.lead);
+                    out.push_str(token.core);
+                    out.push(' ');
+                    out.push_str(&decimal.text);
+                    out.push_str(decimal.trail);
+                    index = decimal.end;
+                    continue;
+                }
+            }
             if let Some(run) = read_run(&tokens, index + 1) {
                 if let Some((digits, _)) = render(&run) {
                     if !blocked(&tokens, index, run.end) {
@@ -95,6 +122,16 @@ pub fn normalize(text: &str) -> String {
             }
         }
         if is_code_letter(token) {
+            if let Some(decimal) = read_decimal(&tokens, index + 1) {
+                if !blocked(&tokens, index, decimal.end) {
+                    out.push_str(token.ws);
+                    out.push_str(token.core);
+                    out.push_str(&decimal.text);
+                    out.push_str(decimal.trail);
+                    index = decimal.end;
+                    continue;
+                }
+            }
             if let Some(run) = read_run(&tokens, index + 1) {
                 if let Some((digits, _)) = render(&run) {
                     if !blocked(&tokens, index, run.end) {
@@ -349,6 +386,129 @@ fn additive(values: &[u32]) -> Option<String> {
     Some(total.to_string())
 }
 
+fn read_decimal<'a>(tokens: &[Token<'a>], start: usize) -> Option<Decimal<'a>> {
+    read_spoken_decimal(tokens, start).or_else(|| read_existing_decimal(tokens, start))
+}
+
+fn read_spoken_decimal<'a>(tokens: &[Token<'a>], start: usize) -> Option<Decimal<'a>> {
+    let first = tokens.get(start)?;
+    let run = read_run(tokens, start)?;
+    if !run.trail.is_empty() {
+        return None;
+    }
+    let integer = if run.values == [0] {
+        "0".to_string()
+    } else {
+        render(&run)?.0
+    };
+    read_decimal_tail(tokens, run.end, first.lead, integer)
+}
+
+fn read_existing_decimal<'a>(tokens: &[Token<'a>], start: usize) -> Option<Decimal<'a>> {
+    let first = tokens.get(start)?;
+    if first.core.is_empty() || !first.trail.is_empty() || first.core.contains('.') {
+        return None;
+    }
+    if !first.core.chars().all(|value| value.is_ascii_digit())
+        && !is_trailing_identifier(first.core)
+    {
+        return None;
+    }
+    read_decimal_tail(tokens, start + 1, first.lead, first.core.to_string())
+}
+
+fn is_trailing_identifier(core: &str) -> bool {
+    let Some(split) = core
+        .char_indices()
+        .find(|(_, value)| value.is_ascii_digit())
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    let (prefix, digits) = core.split_at(split);
+    (1..=8).contains(&prefix.len())
+        && prefix.chars().all(|value| value.is_ascii_uppercase())
+        && !digits.is_empty()
+        && digits.chars().all(|value| value.is_ascii_digit())
+}
+
+fn read_decimal_tail<'a>(
+    tokens: &[Token<'a>],
+    point: usize,
+    lead: &'a str,
+    integer: String,
+) -> Option<Decimal<'a>> {
+    let token = tokens.get(point)?;
+    if !token.lead.is_empty()
+        || !token.trail.is_empty()
+        || !token.core.eq_ignore_ascii_case("point")
+    {
+        return None;
+    }
+    let (fraction, end, trail) = read_fraction(tokens, point + 1)?;
+    Some(Decimal {
+        text: format!("{integer}.{fraction}"),
+        end,
+        lead,
+        trail,
+    })
+}
+
+fn read_fraction<'a>(tokens: &[Token<'a>], start: usize) -> Option<(String, usize, &'a str)> {
+    let mut digits = String::new();
+    let mut index = start;
+    let mut trail = "";
+    while let Some(token) = tokens.get(index) {
+        if !token.lead.is_empty() {
+            break;
+        }
+        let Some((chunk, end)) = read_fraction_component(tokens, index) else {
+            break;
+        };
+        digits.push_str(&chunk);
+        trail = tokens[end - 1].trail;
+        index = end;
+        if !trail.is_empty() {
+            break;
+        }
+    }
+    if index == start {
+        return None;
+    }
+    if trail.is_empty() && tokens.get(index).is_some_and(|token| {
+        token.lead.is_empty() && spoken_value(token.core).is_some_and(|value| value >= 100)
+    }) {
+        return None;
+    }
+    Some((digits, index, trail))
+}
+
+fn read_fraction_component<'a>(tokens: &[Token<'a>], start: usize) -> Option<(String, usize)> {
+    let token = tokens.get(start)?;
+    if !token.core.is_empty() && token.core.chars().all(|value| value.is_ascii_digit()) {
+        return Some((token.core.to_string(), start + 1));
+    }
+    let value = spoken_value(token.core)?;
+    if value <= 9 {
+        return Some((value.to_string(), start + 1));
+    }
+    if value >= 100 {
+        return None;
+    }
+    if value % 10 == 0 && token.trail.is_empty() {
+        if let Some(next) = tokens.get(start + 1) {
+            if next.lead.is_empty() {
+                if let Some(unit) =
+                    spoken_value(next.core).filter(|unit| (1..=9).contains(unit))
+                {
+                    return Some(((value + unit).to_string(), start + 2));
+                }
+            }
+        }
+    }
+    Some((value.to_string(), start + 1))
+}
+
 fn blocked(tokens: &[Token<'_>], start: usize, end: usize) -> bool {
     let before = start.checked_sub(1).and_then(|index| tokens.get(index));
     let after = tokens.get(end);
@@ -413,6 +573,75 @@ mod tests {
         assert_eq!(normalize("a five"), "a five");
         assert_eq!(normalize("I five"), "I five");
         assert_eq!(normalize("x two"), "x two");
+    }
+
+    #[test]
+    fn spoken_decimals_and_versions_use_dots() {
+        assert_eq!(normalize("V four point one"), "V4.1");
+        assert_eq!(normalize("V4 point one"), "V4.1");
+        assert_eq!(normalize("version four point one"), "version 4.1");
+        assert_eq!(normalize("three point one four"), "3.14");
+        assert_eq!(normalize("three point 14"), "3.14");
+        assert_eq!(normalize("zero point five"), "0.5");
+        assert_eq!(
+            normalize("it is three point five gigabytes"),
+            "it is 3.5 gigabytes"
+        );
+        assert_eq!(normalize("RTX fifty eighty point five"), "RTX 5080.5");
+        assert_eq!(
+            normalize("DeepSeek V four point one Flash one thousand seventeen"),
+            "DeepSeek V4.1 Flash 1017"
+        );
+    }
+
+    #[test]
+    fn grouped_and_leading_zero_fractions_become_decimals() {
+        assert_eq!(normalize("three point twenty five"), "3.25");
+        assert_eq!(
+            normalize("three point twenty five gigabytes"),
+            "3.25 gigabytes"
+        );
+        assert_eq!(normalize("three point ninety five"), "3.95");
+        assert_eq!(normalize("three point one twenty five"), "3.125");
+        assert_eq!(normalize("three point one oh five"), "3.105");
+        assert_eq!(normalize("three point zero five"), "3.05");
+        assert_eq!(normalize("zero point zero zero one"), "0.001");
+        assert_eq!(normalize("V four point twenty five"), "V4.25");
+        assert_eq!(normalize("V4 point ninety five"), "V4.95");
+        assert_eq!(normalize("three point five six"), "3.56");
+        assert_eq!(normalize("three point fifty"), "3.50");
+    }
+
+    #[test]
+    fn decimals_need_numbers_or_clear_identifiers_before_the_point() {
+        assert_eq!(normalize("abc1 point five"), "abc1 point five");
+        assert_eq!(normalize("V4 point five"), "V4.5");
+        assert_eq!(normalize("H100 point five"), "H100.5");
+        assert_eq!(
+            normalize("the point twenty five is important"),
+            "the point twenty five is important"
+        );
+    }
+
+    #[test]
+    fn decimals_preserve_prose_and_existing_numbers() {
+        assert_eq!(
+            normalize("the point one is important"),
+            "the point one is important"
+        );
+        assert_eq!(normalize("four point"), "four point");
+        assert_eq!(normalize("four, point one"), "four, point one");
+        assert_eq!(normalize("three point twenty, five"), "3.20, five");
+        assert_eq!(normalize("three point five, hundred"), "3.5, hundred");
+        assert_eq!(normalize("? point five"), "? point five");
+        assert_eq!(normalize("meet at four thirty"), "meet at four thirty");
+        assert_eq!(normalize("version 4.1 is out"), "version 4.1 is out");
+        assert_eq!(normalize("call 555-1017"), "call 555-1017");
+        assert_eq!(normalize("4.1"), "4.1");
+        assert_eq!(
+            normalize("deep seek V four point one flash"),
+            "deep seek V4.1 flash"
+        );
     }
 
     #[test]

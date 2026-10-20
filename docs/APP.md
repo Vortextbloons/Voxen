@@ -69,7 +69,7 @@ The **release milestone** is: shortcut → capture → local transcription → i
    - **Model path** — absolute path to the local `.gguf` file
    - **Device** — e.g. `vulkan:0` for GPU, or `cpu`
    - **Microphone** — optional; default uses system default input
-5. **Save changes**, then verify with the first-use checklist in the root [README](../README.md).
+5. **Save changes**, then run through [Dictating into another app](#dictating-into-another-app) below to verify.
 
 ### Dictating into another app
 
@@ -485,7 +485,7 @@ Voxen/
 ├── package.json
 ├── vite.config.ts        # Dev server port 1420
 ├── AGENTS.md             # Contributor / agent editing principles
-└── README.md             # Quick start and verification notes
+└── README.md             # Short overview; setup and dev details here
 ```
 
 Installer: `npm run tauri build -- --bundles nsis`. Runtime and model files are **not** bundled; users configure paths after install.
@@ -645,6 +645,6 @@ Phrase replacements, the deterministic normalizer, offline local inference, and 
 
 ## Quick links
 
-- Root [README](../README.md) — setup, first-use check, build installer
+- Root [README](../README.md) — short overview and link here
 - [NeMo-Speech.cpp v0.2.0 release](https://github.com/NVIDIA/NeMo-Speech.cpp/releases/tag/v0.2.0)
 - [Parakeet TDT 0.6B v3 model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)

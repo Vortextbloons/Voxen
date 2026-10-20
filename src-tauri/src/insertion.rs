@@ -1,12 +1,14 @@
 #[cfg(target_os = "windows")]
 mod windows_insertion {
+    use crate::Cancellation;
     use std::{
+        cell::RefCell,
         mem::ManuallyDrop,
         ptr, thread,
         time::{Duration, Instant},
     };
     use windows::Win32::{
-        Foundation::{GetLastError, GlobalFree, HANDLE, HWND},
+        Foundation::{GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         Graphics::Gdi::{HBITMAP, HENHMETAFILE},
         System::{
             Com::{STGMEDIUM, STGMEDIUM_0},
@@ -14,17 +16,225 @@ mod windows_insertion {
                 EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardSequenceNumber,
                 SetClipboardData,
             },
+            LibraryLoader::GetModuleHandleW,
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::{OleDuplicateData, ReleaseStgMedium},
+            Threading::GetCurrentThreadId,
         },
         UI::{
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
+                KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_LSHIFT,
+                VK_RETURN, VK_RSHIFT, VK_SHIFT,
             },
-            WindowsAndMessaging::{GetForegroundWindow, IsWindow},
+            WindowsAndMessaging::{
+                CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, IsWindow,
+                PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+                UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+                PM_NOREMOVE, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
+                WM_SYSKEYUP,
+            },
         },
     };
+
+    thread_local! {
+        static POLICY: RefCell<Option<SubmissionPolicy>> = RefCell::new(None);
+    }
+
+    #[derive(Clone, Copy)]
+    struct KeyEvent {
+        key: u16,
+        down: bool,
+        injected: bool,
+        foreground: isize,
+    }
+
+    struct SubmissionPolicy {
+        cancellation: Cancellation,
+        target: isize,
+        left_shift_down: bool,
+        right_shift_down: bool,
+        enter_down: bool,
+    }
+
+    impl SubmissionPolicy {
+        fn new(
+            cancellation: Cancellation,
+            target: isize,
+            left_shift_down: bool,
+            right_shift_down: bool,
+            enter_down: bool,
+        ) -> Self {
+            Self {
+                cancellation,
+                target,
+                left_shift_down,
+                right_shift_down,
+                enter_down,
+            }
+        }
+
+        fn observe(&mut self, event: KeyEvent) -> bool {
+            if event.injected {
+                return false;
+            }
+            if event.key == VK_SHIFT.0 || event.key == VK_LSHIFT.0 || event.key == VK_RSHIFT.0 {
+                if event.key == VK_LSHIFT.0 {
+                    self.left_shift_down = event.down;
+                } else if event.key == VK_RSHIFT.0 {
+                    self.right_shift_down = event.down;
+                } else {
+                    self.left_shift_down = event.down;
+                    self.right_shift_down = event.down;
+                }
+                return false;
+            }
+            if event.key != VK_RETURN.0 {
+                return false;
+            }
+            if !event.down {
+                self.enter_down = false;
+                return false;
+            }
+            if self.enter_down {
+                return false;
+            }
+            self.enter_down = true;
+            if self.target == 0
+                || event.foreground != self.target
+                || self.left_shift_down
+                || self.right_shift_down
+                || self.cancellation.is_cancelled()
+                || self.cancellation.is_finished()
+            {
+                return false;
+            }
+            self.cancellation.cancel();
+            true
+        }
+    }
+
+    unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let message = wparam.0 as u32;
+            let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+            let up = message == WM_KEYUP || message == WM_SYSKEYUP;
+            if down || up {
+                let keyboard = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+                let key = keyboard.vkCode as u16;
+                let foreground = if key == VK_RETURN.0 {
+                    unsafe { GetForegroundWindow().0 as isize }
+                } else {
+                    0
+                };
+                let event = KeyEvent {
+                    key,
+                    down,
+                    injected: (keyboard.flags.0 & LLKHF_INJECTED.0) != 0,
+                    foreground,
+                };
+                POLICY.with(|policy| {
+                    if let Some(policy) = policy.borrow_mut().as_mut() {
+                        policy.observe(event);
+                    }
+                });
+            }
+        }
+        unsafe { CallNextHookEx(HHOOK(ptr::null_mut()), code, wparam, lparam) }
+    }
+
+    pub struct SubmissionObserver {
+        thread: Option<thread::JoinHandle<()>>,
+        thread_id: u32,
+    }
+
+    impl SubmissionObserver {
+        pub fn install(target: isize, cancellation: &Cancellation) -> Result<Self, String> {
+            let cancellation = cancellation.clone();
+            let (ready, receiver) = std::sync::mpsc::channel();
+            let thread = thread::Builder::new()
+                .name("voxen-keyboard".into())
+                .spawn(move || {
+                    let policy = SubmissionPolicy::new(
+                        cancellation,
+                        target,
+                        unsafe { GetAsyncKeyState(VK_LSHIFT.0 as i32) } < 0,
+                        unsafe { GetAsyncKeyState(VK_RSHIFT.0 as i32) } < 0,
+                        unsafe { GetAsyncKeyState(VK_RETURN.0 as i32) } < 0,
+                    );
+                    POLICY.with(|current| *current.borrow_mut() = Some(policy));
+                    let mut message = MSG::default();
+                    unsafe {
+                        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+                    }
+                    let thread_id = unsafe { GetCurrentThreadId() };
+                    let module = match unsafe { GetModuleHandleW(None) } {
+                        Ok(module) => HINSTANCE(module.0),
+                        Err(error) => {
+                            POLICY.with(|current| *current.borrow_mut() = None);
+                            let _ = ready.send(Err(format!(
+                                "Could not locate the application module: {error}"
+                            )));
+                            return;
+                        }
+                    };
+                    let hook = match unsafe {
+                        SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0)
+                    } {
+                        Ok(hook) => hook,
+                        Err(error) => {
+                            POLICY.with(|current| *current.borrow_mut() = None);
+                            let _ =
+                                ready.send(Err(format!("Could not observe the keyboard: {error}")));
+                            return;
+                        }
+                    };
+                    let _ = ready.send(Ok(thread_id));
+                    loop {
+                        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
+                        if result.0 <= 0 {
+                            break;
+                        }
+                        unsafe {
+                            let _ = TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                    }
+                    unsafe {
+                        let _ = UnhookWindowsHookEx(hook);
+                    }
+                    POLICY.with(|current| *current.borrow_mut() = None);
+                })
+                .map_err(|error| format!("Could not start keyboard observation: {error}"))?;
+            match receiver.recv() {
+                Ok(Ok(thread_id)) => Ok(Self {
+                    thread: Some(thread),
+                    thread_id,
+                }),
+                Ok(Err(error)) => {
+                    let _ = thread.join();
+                    Err(error)
+                }
+                Err(error) => {
+                    let _ = thread.join();
+                    Err(format!("Keyboard observation failed to start: {error}"))
+                }
+            }
+        }
+    }
+
+    impl Drop for SubmissionObserver {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                if !thread.is_finished() {
+                    unsafe {
+                        let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+                    }
+                }
+                let _ = thread.join();
+            }
+        }
+    }
 
     const CF_BITMAP: u32 = 2;
     const CF_METAFILEPICT: u32 = 3;
@@ -180,13 +390,26 @@ mod windows_insertion {
         }
     }
 
-    pub fn insert_text(foreground: isize, text: &str) -> Result<(), String> {
+    pub fn insert_text(
+        foreground: isize,
+        text: &str,
+        cancellation: &Cancellation,
+    ) -> Result<(), String> {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         let hwnd = HWND(foreground as *mut _);
         ensure_original_foreground(hwnd)?;
 
         let release_deadline = Instant::now() + Duration::from_secs(2);
-        while !modifiers_released() && Instant::now() < release_deadline {
+        while !modifiers_released()
+            && Instant::now() < release_deadline
+            && !cancellation.is_cancelled()
+        {
             thread::sleep(Duration::from_millis(20));
+        }
+        if cancellation.is_cancelled() {
+            return Ok(());
         }
         if !modifiers_released() {
             return Err(
@@ -194,6 +417,9 @@ mod windows_insertion {
             );
         }
         ensure_original_foreground(hwnd)?;
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
 
         let _clipboard = clipboard_win::Clipboard::new_for(hwnd.0)
             .map_err(|error| format!("Could not open clipboard: {error}"))?;
@@ -212,6 +438,9 @@ mod windows_insertion {
         drop(_clipboard);
 
         let paste = (|| {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
             ensure_original_foreground(hwnd)?;
             let inputs = [
                 key_input(0x11, false),
@@ -308,10 +537,13 @@ mod windows_insertion {
             .collect()
     }
 
-    fn backspace(count: usize) -> Result<(), String> {
+    fn backspace(count: usize, cancellation: &Cancellation) -> Result<(), String> {
         const BATCH: usize = 32;
         let mut remaining = count;
         while remaining > 0 {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
             let batch = remaining.min(BATCH);
             let mut inputs = Vec::with_capacity(batch * 2);
             for _ in 0..batch {
@@ -324,10 +556,13 @@ mod windows_insertion {
         Ok(())
     }
 
-    fn type_unicode(text: &str) -> Result<(), String> {
+    fn type_unicode(text: &str, cancellation: &Cancellation) -> Result<(), String> {
         const BATCH: usize = 32;
         let units: Vec<u16> = text.encode_utf16().collect();
         for chunk in units.chunks(BATCH) {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
             let mut inputs = Vec::with_capacity(chunk.len() * 2);
             for unit in chunk {
                 inputs.push(unicode_input(*unit, false));
@@ -349,11 +584,22 @@ mod windows_insertion {
         (previous.len() - shared, next[shared..].iter().collect())
     }
 
-    pub fn replace_text(foreground: isize, previous: &str, next: &str) -> Result<(), String> {
+    pub fn replace_text(
+        foreground: isize,
+        previous: &str,
+        next: &str,
+        cancellation: &Cancellation,
+    ) -> Result<(), String> {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         let hwnd = HWND(foreground as *mut _);
         ensure_original_foreground(hwnd)?;
         let (deletes, inserted) = live_edit(previous, next);
         if deletes == 0 && inserted.is_empty() {
+            return Ok(());
+        }
+        if cancellation.is_cancelled() {
             return Ok(());
         }
 
@@ -362,9 +608,12 @@ mod windows_insertion {
             send_key(*key, true)?;
         }
         let typed = (|| {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
             ensure_original_foreground(hwnd)?;
-            backspace(deletes)?;
-            type_unicode(&inserted)
+            backspace(deletes, cancellation)?;
+            type_unicode(&inserted, cancellation)
         })();
         let restored = modifiers
             .iter()
@@ -380,6 +629,106 @@ mod windows_insertion {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn cancelled_sessions_never_touch_the_target_window() {
+            let cancellation = Cancellation::new();
+            cancellation.cancel();
+            assert!(insert_text(0, "submitted", &cancellation).is_ok());
+            assert!(replace_text(0, "submitted", "cleaned", &cancellation).is_ok());
+        }
+
+        fn event(key: u16, down: bool, injected: bool, foreground: isize) -> KeyEvent {
+            KeyEvent {
+                key,
+                down,
+                injected,
+                foreground,
+            }
+        }
+
+        #[test]
+        fn observer_installs_and_stops_cleanly() {
+            let cancellation = Cancellation::new();
+            let observer = SubmissionObserver::install(0, &cancellation).unwrap();
+            drop(observer);
+        }
+
+        #[test]
+        fn injected_enter_does_not_submit_but_physical_enter_does() {
+            let cancellation = Cancellation::new();
+            let mut policy =
+                SubmissionPolicy::new(cancellation.clone(), 7, false, false, false);
+            assert!(!policy.observe(event(VK_RETURN.0, true, true, 7)));
+            assert!(!policy.observe(event(VK_RETURN.0, false, true, 7)));
+            assert!(!cancellation.is_cancelled());
+            assert!(policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(cancellation.is_cancelled());
+        }
+
+        #[test]
+        fn enter_only_submits_in_the_target_window() {
+            let cancellation = Cancellation::new();
+            let mut policy =
+                SubmissionPolicy::new(cancellation.clone(), 7, false, false, false);
+            assert!(!policy.observe(event(VK_RETURN.0, true, false, 8)));
+            assert!(!policy.observe(event(VK_RETURN.0, false, false, 8)));
+            assert!(!cancellation.is_cancelled());
+            assert!(policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(cancellation.is_cancelled());
+        }
+
+        #[test]
+        fn shift_enter_keeps_a_newline_even_if_shift_is_released_first() {
+            let cancellation = Cancellation::new();
+            let mut policy =
+                SubmissionPolicy::new(cancellation.clone(), 7, false, false, false);
+            assert!(!policy.observe(event(VK_LSHIFT.0, true, false, 0)));
+            assert!(!policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(!policy.observe(event(VK_LSHIFT.0, false, false, 0)));
+            assert!(!policy.observe(event(VK_RETURN.0, false, false, 7)));
+            assert!(!cancellation.is_cancelled());
+            assert!(policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(cancellation.is_cancelled());
+        }
+
+        #[test]
+        fn repeated_enter_keydowns_submit_only_once() {
+            let cancellation = Cancellation::new();
+            let mut policy =
+                SubmissionPolicy::new(cancellation.clone(), 7, false, false, false);
+            assert!(policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(!policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(cancellation.is_cancelled());
+        }
+
+        #[test]
+        fn enter_held_before_observation_does_not_submit_on_repeat() {
+            let cancellation = Cancellation::new();
+            let mut policy =
+                SubmissionPolicy::new(cancellation.clone(), 7, false, false, true);
+            assert!(!policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(!policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(!cancellation.is_cancelled());
+            assert!(!policy.observe(event(VK_RETURN.0, false, false, 7)));
+            assert!(policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(cancellation.is_cancelled());
+        }
+
+        #[test]
+        fn submission_state_is_scoped_to_one_session() {
+            let first = Cancellation::new();
+            let second = Cancellation::new();
+            let mut first_policy =
+                SubmissionPolicy::new(first.clone(), 7, false, false, false);
+            let mut second_policy =
+                SubmissionPolicy::new(second.clone(), 7, false, false, false);
+            assert!(first_policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(first.is_cancelled());
+            assert!(!second.is_cancelled());
+            assert!(second_policy.observe(event(VK_RETURN.0, true, false, 7)));
+            assert!(second.is_cancelled());
+        }
 
         #[test]
         fn live_edits_only_replace_the_changed_suffix() {
@@ -491,7 +840,7 @@ mod windows_insertion {
             let (sender, receiver) = std::sync::mpsc::channel();
             let target = window.0 as isize;
             thread::spawn(move || {
-                let _ = sender.send(insert_text(target, "Voxen paste ✓"));
+                let _ = sender.send(insert_text(target, "Voxen paste ✓", &Cancellation::new()));
             });
             let deadline = Instant::now() + Duration::from_secs(5);
             let result = loop {
@@ -558,6 +907,7 @@ mod windows_insertion {
             let (sender, receiver) = std::sync::mpsc::channel();
             let target = window.0 as isize;
             thread::spawn(move || {
+                let cancellation = Cancellation::new();
                 let mut result = send_key(0x11, false).and_then(|()| send_key(0x10, false));
                 let mut typed = "";
                 for next in [
@@ -574,7 +924,7 @@ mod windows_insertion {
                     if result.is_err() {
                         break;
                     }
-                    result = replace_text(target, typed, next);
+                    result = replace_text(target, typed, next, &cancellation);
                     typed = next;
                 }
                 let _ = send_key(0x10, true);
@@ -608,14 +958,29 @@ mod windows_insertion {
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_insertion::{insert_text, replace_text};
+pub use windows_insertion::{insert_text, replace_text, SubmissionObserver};
 
 #[cfg(not(target_os = "windows"))]
-pub fn insert_text(_: isize, _: &str) -> Result<(), String> {
+pub struct SubmissionObserver;
+
+#[cfg(not(target_os = "windows"))]
+impl SubmissionObserver {
+    pub fn install(_: isize, _: &crate::Cancellation) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn insert_text(_: isize, _: &str, _: &crate::Cancellation) -> Result<(), String> {
     Err("Text insertion is supported on Windows only".into())
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn replace_text(_: isize, _: &str, _: &str) -> Result<(), String> {
+pub fn replace_text(
+    _: isize,
+    _: &str,
+    _: &str,
+    _: &crate::Cancellation,
+) -> Result<(), String> {
     Err("Text insertion is supported on Windows only".into())
 }
