@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="132" y1="92" x2="900" y2="936" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#142343"/>
+      <stop offset="1" stop-color="#080F25"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="146" y1="510" x2="884" y2="510" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#16C9FF"/>
+      <stop offset=".5" stop-color="#5789FF"/>
+      <stop offset="1" stop-color="#A42DFF"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="286" y1="425" x2="740" y2="599" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#12C9FF"/>
+      <stop offset=".52" stop-color="#617EFF"/>
+      <stop offset="1" stop-color="#B22AFF"/>
+    </linearGradient>
+    <linearGradient id="mic" x1="512" y1="331" x2="512" y2="708" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#CBD9FF"/>
+    </linearGradient>
+    <filter id="glow" x="84" y="220" width="856" height="584" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="34"/>
+    </filter>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="248" fill="url(#background)"/>
+  <rect x="72" y="72" width="880" height="880" rx="240" stroke="url(#edge)" stroke-opacity=".28" stroke-width="16"/>
+  <g filter="url(#glow)" opacity=".42">
+    <path d="M260 510h26m58-100v200m396-200v200m58-150v100" stroke="url(#wave)" stroke-linecap="round" stroke-width="34"/>
+    <path d="M512 366v184a82 82 0 0 1-164 0v-64m328 0v64a164 164 0 0 1-328 0" stroke="#5488FF" stroke-linecap="round" stroke-width="38"/>
+  </g>
+  <path d="M260 510h26m58-100v200m396-200v200m58-150v100" stroke="url(#wave)" stroke-linecap="round" stroke-width="30"/>
+  <rect x="462" y="326" width="100" height="274" rx="50" fill="url(#mic)"/>
+  <path d="M380 510v40a132 132 0 0 0 264 0v-40" fill="none" stroke="url(#mic)" stroke-linecap="round" stroke-width="34"/>
+  <path d="M512 682v34m-58 0h116" fill="none" stroke="url(#mic)" stroke-linecap="round" stroke-width="28"/>
+</svg>

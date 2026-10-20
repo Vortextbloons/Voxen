@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Voxen preview</title>
+	</head>
+	<body>
+		<div id="app"></div>
+		<script>
+			const snapshot = {
+				config: {
+					microphone: '',
+					shortcut: 'Ctrl+Shift+Space',
+					activationMode: 'hold',
+					runtimePath: 'C:\\Tools\\NeMo\\nemo_speech_asr_c.dll',
+					modelPath: 'C:\\Models\\parakeet-tdt-0.6b.gguf',
+					device: 'vulkan:0',
+					replacements: [
+						{ from: 'voxen', to: 'Voxen' },
+						{ from: 'uh', to: '' }
+					],
+					unloadAfterSeconds: 300,
+					cleanupMode: 'light',
+					cleanupRuntimePath: 'C:\\Tools\\llama-server.exe',
+					cleanupModelPath: 'C:\\Models\\Qwen3.5-2B-Q4_K_S.gguf'
+				},
+				phase: 'idle',
+				error: null,
+				lastTranscript:
+					'This is the last transcription. It shows how the transcript appears in the sidebar after dictation.',
+				liveTranscript: null,
+				modelLoaded: true
+			};
+
+			window.__TAURI_INTERNALS__ = {
+				transformCallback: (callback) => {
+					const id = Math.floor(Math.random() * 1e9);
+					window['_' + id] = callback;
+					return id;
+				},
+				unregisterCallback: () => {},
+				invoke: async (cmd) => {
+					if (cmd === 'get_snapshot') return snapshot;
+					if (cmd === 'list_microphones') return ['System default', 'Microphone Array (Realtek)'];
+					if (cmd === 'save_config') return snapshot;
+					if (cmd === 'plugin:event|listen') return 1;
+					return null;
+				}
+			};
+			window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+			const tab = new URLSearchParams(window.location.search).get('tab');
+			if (tab) {
+				setTimeout(() => document.getElementById(`tab-${tab}`)?.click(), 800);
+			}
+		</script>
+		<script type="module" src="/src/main.ts"></script>
+	</body>
+</html>

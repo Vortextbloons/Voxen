@@ -1,31 +1,38 @@
 :root {
 	color-scheme: dark;
 	accent-color: var(--accent);
-	--bg: #151a22;
-	--surface: #202734;
-	--surface-soft: #191f29;
-	--ink: #eef2f8;
-	--ink-soft: #aeb9ca;
-	--ink-faint: #8f9bab;
-	--line: #394558;
-	--accent: #376fc7;
-	--accent-hover: #2d61b4;
-	--accent-soft: #253858;
-	--danger: #ff9d93;
-	--danger-soft: #412b32;
-	--ok: #7ddba3;
-	--radius: 6px;
-}		
+	--bg: #0f141c;
+	--surface: #161c26;
+	--surface-soft: #0b0f15;
+	--surface-hover: #1c2432;
+	--ink: #e8edf5;
+	--ink-soft: #9da9bb;
+	--ink-faint: #748092;
+	--line: #232c39;
+	--line-strong: #344154;
+	--accent: #5b7cfa;
+	--accent-hover: #6f8cff;
+	--accent-soft: #1a2438;
+	--accent-cyan: #2fb4ff;
+	--accent-blue: #3b82f6;
+	--accent-violet: #9b5cff;
+	--danger: #f87171;
+	--danger-soft: #2a181c;
+	--ok: #4ade80;
+	--radius: 8px;
+}
 
 * {
 	box-sizing: border-box;
+	scrollbar-width: thin;
+	scrollbar-color: var(--line-strong) transparent;
 }
 
 body {
 	margin: 0;
 	font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
 	font-size: 13px;
-	line-height: 1.5;
+	line-height: 1.55;
 	color: var(--ink);
 	background: var(--bg);
 	-webkit-font-smoothing: antialiased;
@@ -39,6 +46,10 @@ textarea {
 	color: inherit;
 }
 
+input[type='radio'] {
+	accent-color: var(--accent);
+}
+
 h1,
 h2,
 p {
@@ -50,33 +61,71 @@ p {
 	outline-offset: 1px;
 }
 
+::selection {
+	background: var(--accent-soft);
+	color: var(--ink);
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+	background: var(--line-strong);
+	border: 2px solid var(--bg);
+	border-radius: 999px;
+}
+
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+
 input[type='text'],
 input[type='number'],
 select {
 	width: 100%;
-	max-width: 26rem;
-	padding: 5px 8px;
+	max-width: 30rem;
+	padding: 7px 10px;
 	border: 1px solid var(--line);
 	border-radius: var(--radius);
 	background: var(--surface);
+	transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+input[type='text']:not(:disabled):hover,
+input[type='number']:not(:disabled):hover,
+select:not(:disabled):hover {
+	border-color: var(--line-strong);
+}
+
+input[type='text']:focus,
+input[type='number']:focus,
+select:focus {
+	outline: none;
+	border-color: var(--accent);
+	box-shadow: 0 0 0 3px rgba(91, 124, 250, 0.16);
 }
 
 button {
 	border: 1px solid var(--line);
 	border-radius: var(--radius);
 	background: var(--surface);
-	padding: 5px 12px;
+	padding: 6px 12px;
+	font-size: 12.5px;
+	font-weight: 500;
 	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease;
 }
 
 button:disabled {
-	opacity: 0.5;
+	opacity: 0.45;
 	cursor: default;
 }
 
 button:not(:disabled):hover {
-	border-color: var(--ink-faint);
-	background: var(--surface-soft);
+	border-color: var(--line-strong);
+	background: var(--surface-hover);
 }
 
 .error {
@@ -85,31 +134,33 @@ button:not(:disabled):hover {
 }
 
 .hint {
-	color: var(--ink-soft);
+	color: var(--ink-faint);
 	font-size: 11.5px;
+	line-height: 1.55;
 }
 
 .intro {
-	color: var(--ink-soft);
+	color: var(--ink-faint);
 	font-size: 12px;
+	line-height: 1.6;
 	max-width: 46rem;
-	margin-bottom: 12px;
+	margin-bottom: 14px;
 }
 
 .field {
 	display: flex;
 	flex-direction: column;
-	gap: 4px;
+	gap: 6px;
 }
 
 .field + .field {
-	margin-top: 14px;
+	margin-top: 16px;
 }
 
 .field > label,
 .field > legend {
-	font-weight: 600;
-	font-size: 12px;
+	font-weight: 500;
+	font-size: 12.5px;
 }
 
 fieldset.field {
@@ -120,5 +171,5 @@ fieldset.field {
 
 .field + fieldset.field,
 fieldset.field + .field {
-	margin-top: 14px;
+	margin-top: 16px;
 }

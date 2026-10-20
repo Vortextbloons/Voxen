@@ -2,7 +2,7 @@ export type ActivationMode = 'hold' | 'toggle';
 
 export type CleanupMode = 'raw' | 'light' | 'polished';
 
-export type Phase = 'idle' | 'recording' | 'transcribing' | 'inserting' | 'error';
+export type Phase = 'idle' | 'starting' | 'recording' | 'transcribing' | 'inserting' | 'error';
 
 export interface Replacement {
 	from: string;
@@ -34,6 +34,7 @@ export interface AppSnapshot {
 
 export const phaseLabels: Record<Phase, string> = {
 	idle: 'Idle',
+	starting: 'Starting',
 	recording: 'Recording',
 	transcribing: 'Transcribing',
 	inserting: 'Inserting',

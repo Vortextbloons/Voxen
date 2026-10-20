@@ -29,7 +29,7 @@ The CLI prints the resulting local GGUF path. Set that path and the absolute pat
 
 ## Text cleanup setup
 
-Cleanup is optional and off by default (`raw` mode). It needs a `llama-server` binary and a small instruction model on disk — both stay local. Verified with the llama.cpp 2.51.0 Vulkan backend and `Qwen3.5-2B-Q4_K_S.gguf` (the smaller Qwen3.5-0.8B proved too weak: it echoed fillers or dropped hedging). In Voxen's settings choose **Light** or **Polished**, set the cleanup runtime path to `llama-server.exe` (or its folder) and the cleanup model path to the GGUF file, then save. If a cleanup reply rewrites too much, the original transcript is kept and a warning appears in the sidebar.
+Cleanup is optional and off by default (`raw` mode). It needs a `llama-server` binary and a small instruction model on disk — both stay local. Verified with the llama.cpp 2.51.0 Vulkan backend and `Qwen3.5-2B-Q4_K_S.gguf` (the smaller Qwen3.5-0.8B proved too weak: it echoed fillers or dropped hedging). In Voxen's settings choose **Light** or **Polished**, set the cleanup runtime path to `llama-server.exe` (or its folder) and the cleanup model path to the GGUF file, then save. If a cleanup reply rewrites too much, the original transcript is kept and a warning appears in the sidebar. Spoken numbers and model codes are normalized by a built-in deterministic pass that needs no setup (`M Five` → `M5`, `ninety nine fifty X` → `9950X`, `fifty eighty` → `5080`) and runs in every mode.
 
 ## First-use check
 
@@ -50,7 +50,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The release milestone is shortcut → capture → local transcription → insertion. Launch at login, ASR vocabulary boosting, persisted history, application-specific formatting, and performance tuning are later work. Phrase replacements and the optional local text cleanup pass are available now; transcripts are retained only in RAM.
+The release milestone is shortcut → capture → local transcription → insertion. Launch at login, ASR vocabulary boosting, persisted history, application-specific formatting, and performance tuning are later work. Phrase replacements, automatic spoken-number normalization, and the optional local text cleanup pass are available now; transcripts are retained only in RAM.
 
 The settings window closes completely while dictation stays available in the system tray. Choose **Settings** from the tray menu to reopen it, or **Quit** to stop Voxen. The **Test microphone** button keeps its result in the settings window; global dictation inserts into the original foreground application. If you switch applications before insertion, Voxen keeps the transcript and reports the focus change.
 

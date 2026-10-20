@@ -2,6 +2,7 @@ mod cleanup;
 #[cfg(target_os = "windows")]
 mod insertion;
 mod nemo;
+mod normalize;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
@@ -53,11 +54,13 @@ struct Backend {
     inference: mpsc::Sender<InferenceCommand>,
     foreground: isize,
     shortcut_capture: bool,
+    start_cancelled: bool,
 }
 
 struct AppState(Mutex<Backend>);
-struct IndicatorState(Mutex<()>);
+struct IndicatorState(Mutex<bool>);
 type CapturedAudio = Result<(Vec<f32>, u32), String>;
+const DEFAULT_UNLOAD_SECONDS: u64 = 300;
 
 enum AudioCommand {
     Start(Option<String>, mpsc::Sender<Result<(), String>>),
@@ -68,6 +71,7 @@ enum AudioCommand {
 enum InferenceCommand {
     Transcribe(Config, Vec<f32>, u32, isize),
     Unload,
+    UnloadCleanup,
     StartLive(Config, isize),
     LiveAudio(Vec<f32>, u32),
 }
@@ -91,7 +95,7 @@ fn default_config() -> Config {
         model_path: String::new(),
         device: "vulkan:0".into(),
         replacements: vec![],
-        unload_after_seconds: 300,
+        unload_after_seconds: DEFAULT_UNLOAD_SECONDS,
         cleanup_mode: cleanup::Mode::Raw,
         cleanup_runtime_path: String::new(),
         cleanup_model_path: String::new(),
@@ -147,47 +151,77 @@ fn publish(app: &AppHandle) -> AppSnapshot {
     snapshot
 }
 
+fn build_indicator(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "indicator",
+        tauri::WebviewUrl::App("index.html?indicator=1".into()),
+    )
+    .title("Voxen dictation")
+    .inner_size(168.0, 68.0)
+    .transparent(true)
+    .decorations(false)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .focusable(false)
+    .visible(false)
+    .build()?;
+    let _ = window.set_ignore_cursor_events(true);
+    Ok(window)
+}
+
+fn position_indicator(window: &tauri::WebviewWindow) {
+    if let Ok(Some(monitor)) = window.primary_monitor() {
+        let scale = monitor.scale_factor();
+        let size = monitor.size();
+        let origin = monitor.position();
+        let _ = window.set_position(tauri::PhysicalPosition::new(
+            origin.x + (size.width as i32 - (168.0 * scale) as i32) / 2,
+            origin.y + size.height as i32 - (108.0 * scale) as i32,
+        ));
+    }
+}
+
+fn indicator_active(phase: &str, starting_cancelled: bool) -> bool {
+    match phase {
+        "starting" => !starting_cancelled,
+        "recording" | "transcribing" | "inserting" => true,
+        _ => false,
+    }
+}
+
 fn update_indicator(app: &AppHandle) {
     let indicator = app.state::<IndicatorState>();
-    let _guard = indicator.0.lock().unwrap();
-    let phase = app
-        .state::<AppState>()
-        .0
-        .lock()
-        .unwrap()
-        .snapshot
-        .phase
-        .clone();
-    if matches!(phase.as_str(), "recording" | "transcribing" | "inserting") {
-        if app.get_webview_window("indicator").is_none() {
-            let builder = tauri::WebviewWindowBuilder::new(
-                app,
-                "indicator",
-                tauri::WebviewUrl::App("index.html?indicator=1".into()),
-            )
-            .title("Voxen dictation")
-            .inner_size(190.0, 44.0)
-            .decorations(false)
-            .resizable(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .focused(false)
-            .focusable(false);
-            if let Ok(window) = builder.build() {
-                let _ = window.set_ignore_cursor_events(true);
-                if let Ok(Some(monitor)) = window.primary_monitor() {
-                    let scale = monitor.scale_factor();
-                    let size = monitor.size();
-                    let origin = monitor.position();
-                    let _ = window.set_position(tauri::PhysicalPosition::new(
-                        origin.x + (size.width as i32 - (190.0 * scale) as i32) / 2,
-                        origin.y + size.height as i32 - (110.0 * scale) as i32,
-                    ));
+    let mut visible = indicator.0.lock().unwrap();
+    let (phase, starting_cancelled) = {
+        let state = app.state::<AppState>();
+        let backend = state.0.lock().unwrap();
+        (backend.snapshot.phase.clone(), backend.start_cancelled)
+    };
+    if indicator_active(&phase, starting_cancelled) {
+        let window = match app.get_webview_window("indicator") {
+            Some(window) => window,
+            None => match build_indicator(app) {
+                Ok(window) => {
+                    *visible = false;
+                    window
                 }
+                Err(_) => return,
+            },
+        };
+        if !*visible {
+            position_indicator(&window);
+            if window.show().is_ok() {
+                *visible = true;
             }
         }
-    } else if let Some(window) = app.get_webview_window("indicator") {
-        let _ = window.destroy();
+    } else if *visible {
+        if let Some(window) = app.get_webview_window("indicator") {
+            let _ = window.hide();
+        }
+        *visible = false;
     }
 }
 
@@ -363,13 +397,20 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
     let mut model: Option<nemo::Recognizer> = None;
     let mut cleaner: Option<cleanup::Cleaner> = None;
     let mut deadline: Option<Instant> = None;
+    let mut unload_model_on_idle = false;
     let mut live: Option<Live> = None;
     loop {
         let command = match deadline {
             Some(until) => {
                 match receiver.recv_timeout(until.saturating_duration_since(Instant::now())) {
                     Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => InferenceCommand::Unload,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if unload_model_on_idle {
+                            InferenceCommand::Unload
+                        } else {
+                            InferenceCommand::UnloadCleanup
+                        }
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -391,6 +432,10 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     .snapshot
                     .model_loaded = false;
                 publish(&app);
+            }
+            InferenceCommand::UnloadCleanup => {
+                cleaner = None;
+                deadline = None;
             }
             InferenceCommand::StartLive(config, target) => {
                 live = None;
@@ -434,6 +479,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                         if error.is_none() {
                             let (cleaned, warning) = apply_cleanup(&mut cleaner, &config, transcript.clone());
                             cleanup_warning = warning;
+                            let cleaned = normalize::normalize(&cleaned);
                             if cleaned != transcript && session.target != 0 {
                                 app.state::<AppState>().0.lock().unwrap().snapshot.phase =
                                     "inserting".into();
@@ -473,6 +519,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     let text = apply_replacements(text, &config.replacements);
                     let (text, warning) = apply_cleanup(&mut cleaner, &config, text);
                     cleanup_warning = warning;
+                    let text = normalize::normalize(&text);
                     app.state::<AppState>()
                         .0
                         .lock()
@@ -488,8 +535,14 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     }
                     Ok::<(), String>(())
                 })();
-                deadline = if model.is_some() && config.unload_after_seconds > 0 {
-                    Instant::now().checked_add(Duration::from_secs(config.unload_after_seconds))
+                unload_model_on_idle = config.unload_after_seconds > 0;
+                deadline = if model.is_some() && (unload_model_on_idle || cleaner.is_some()) {
+                    let idle = if unload_model_on_idle {
+                        config.unload_after_seconds
+                    } else {
+                        DEFAULT_UNLOAD_SECONDS
+                    };
+                    Instant::now().checked_add(Duration::from_secs(idle))
                 } else {
                     None
                 };
@@ -596,6 +649,63 @@ fn apply_replacements(text: String, replacements: &[Replacement]) -> String {
 
 fn is_available(phase: &str) -> bool {
     matches!(phase, "idle" | "error")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartCompletion {
+    Listening,
+    Idle,
+    Error,
+}
+
+fn apply_start_completion(backend: &mut Backend, result: Result<(), String>) -> StartCompletion {
+    let cancelled = std::mem::take(&mut backend.start_cancelled);
+    backend.snapshot.live_transcript = None;
+    if cancelled {
+        backend.snapshot.phase = "idle".into();
+        backend.snapshot.error = None;
+        return StartCompletion::Idle;
+    }
+    match result {
+        Ok(()) => {
+            backend.snapshot.phase = "recording".into();
+            backend.snapshot.error = None;
+            StartCompletion::Listening
+        }
+        Err(error) => {
+            backend.snapshot.phase = "error".into();
+            backend.snapshot.error = Some(error);
+            StartCompletion::Error
+        }
+    }
+}
+
+fn complete_start(
+    app: AppHandle,
+    config: Config,
+    foreground: isize,
+    receiver: mpsc::Receiver<Result<(), String>>,
+) {
+    let result = receiver
+        .recv()
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+    let started = result.is_ok();
+    {
+        let state = app.state::<AppState>();
+        let mut backend = state.0.lock().unwrap();
+        if started && backend.start_cancelled {
+            let (tx, _rx) = mpsc::channel();
+            let _ = backend.audio.send(AudioCommand::Stop(tx));
+        }
+        let completion = apply_start_completion(&mut backend, result);
+        if completion == StartCompletion::Listening {
+            let _ = backend
+                .inference
+                .send(InferenceCommand::StartLive(config, foreground));
+        }
+    }
+    publish(&app);
 }
 
 fn validate_config(config: &Config) -> Result<Shortcut, String> {
@@ -735,54 +845,60 @@ fn save_config(
 
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let mut backend = state.0.lock().unwrap();
-    if !is_available(&backend.snapshot.phase) {
-        return Err("Dictation is already in progress".into());
-    }
-    if backend.snapshot.config.runtime_path.trim().is_empty()
-        || backend.snapshot.config.model_path.trim().is_empty()
-    {
-        return Err("Set and save the local runtime and model paths first".into());
-    }
-    #[cfg(target_os = "windows")]
-    {
-        backend.foreground =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize };
-        if app
-            .get_webview_window("main")
-            .and_then(|window| window.hwnd().ok())
-            .is_some_and(|hwnd| hwnd.0 as isize == backend.foreground)
-        {
-            backend.foreground = 0;
+    let (config, foreground, receiver) = {
+        let mut backend = state.0.lock().unwrap();
+        if !is_available(&backend.snapshot.phase) {
+            return Err("Dictation is already in progress".into());
         }
-    }
-    let (tx, rx) = mpsc::channel();
-    backend
-        .audio
-        .send(AudioCommand::Start(
-            backend.snapshot.config.microphone.clone(),
-            tx,
-        ))
-        .map_err(|e| e.to_string())?;
-    rx.recv().map_err(|e| e.to_string())??;
-    backend.snapshot.phase = "recording".into();
-    backend.snapshot.error = None;
-    backend.snapshot.live_transcript = None;
-    backend
-        .inference
-        .send(InferenceCommand::StartLive(
+        if backend.snapshot.config.runtime_path.trim().is_empty()
+            || backend.snapshot.config.model_path.trim().is_empty()
+        {
+            return Err("Set and save the local runtime and model paths first".into());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            backend.foreground =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize };
+            if app
+                .get_webview_window("main")
+                .and_then(|window| window.hwnd().ok())
+                .is_some_and(|hwnd| hwnd.0 as isize == backend.foreground)
+            {
+                backend.foreground = 0;
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        backend
+            .audio
+            .send(AudioCommand::Start(
+                backend.snapshot.config.microphone.clone(),
+                tx,
+            ))
+            .map_err(|e| e.to_string())?;
+        backend.start_cancelled = false;
+        backend.snapshot.phase = "starting".into();
+        backend.snapshot.error = None;
+        backend.snapshot.live_transcript = None;
+        (
             backend.snapshot.config.clone(),
             backend.foreground,
-        ))
-        .map_err(|e| e.to_string())?;
-    drop(backend);
+            rx,
+        )
+    };
     publish(&app);
+    std::thread::spawn(move || complete_start(app, config, foreground, receiver));
     Ok(())
 }
 
 #[tauri::command]
 fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let mut backend = state.0.lock().unwrap();
+    if backend.snapshot.phase == "starting" {
+        backend.start_cancelled = true;
+        drop(backend);
+        publish(&app);
+        return Ok(());
+    }
     if backend.snapshot.phase != "recording" {
         return Err("Recording is not active".into());
     }
@@ -852,26 +968,27 @@ pub fn run() {
     let (inference_tx, inference_rx) = mpsc::channel();
     let audio_inference = inference_tx.clone();
     tauri::Builder::default()
-        .manage(IndicatorState(Mutex::new(())))
+        .manage(IndicatorState(Mutex::new(false)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
             let state = app.state::<AppState>();
             if state.0.lock().unwrap().shortcut_capture { return; }
             let (mode, phase) = { let backend = state.0.lock().unwrap(); (backend.snapshot.config.activation_mode.clone(), backend.snapshot.phase.clone()) };
             let result = match (mode.as_str(), event.state) {
                 ("hold", ShortcutState::Pressed) if is_available(&phase) => start_recording(app.clone(), state),
-                ("hold", ShortcutState::Released) if phase == "recording" => stop_recording(app.clone(), state),
-                ("toggle", ShortcutState::Pressed) if phase == "recording" => stop_recording(app.clone(), state),
+                ("hold", ShortcutState::Released) if matches!(phase.as_str(), "starting" | "recording") => stop_recording(app.clone(), state),
+                ("toggle", ShortcutState::Pressed) if matches!(phase.as_str(), "starting" | "recording") => stop_recording(app.clone(), state),
                 ("toggle", ShortcutState::Pressed) if is_available(&phase) => start_recording(app.clone(), state),
                 _ => Ok(()),
             };
             if let Err(error) = result { report_error(app, error); }
         }).build())
-        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false })))
+        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false, start_cancelled: false })))
         .setup(move |app| {
             let handle = app.handle().clone();
             std::thread::spawn(move || audio_worker(handle, audio_rx, audio_tx, audio_inference));
             let handle = app.handle().clone();
             std::thread::spawn(move || inference_worker(handle, inference_rx));
+            let _ = build_indicator(app.handle());
             if let Ok(directory) = app.path().app_config_dir() {
                 if let Ok(contents) = std::fs::read(directory.join("config.json")) {
                     match serde_json::from_slice::<Config>(&contents) {
@@ -917,8 +1034,19 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![get_snapshot, list_microphones, save_config, set_shortcut_capture, start_recording, stop_recording, unload_model])
         .build(tauri::generate_context!())
         .expect("error while building Voxen")
-        .run(|_, event| {
-            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = event { api.prevent_exit(); }
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            tauri::RunEvent::Exit => {
+                let _ = app
+                    .state::<AppState>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .inference
+                    .send(InferenceCommand::Unload);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            _ => {}
         });
 }
 
@@ -949,10 +1077,64 @@ mod tests {
 
     #[test]
     fn transcribing_and_inserting_block_new_recordings() {
+        assert!(!is_available("starting"));
         assert!(!is_available("transcribing"));
         assert!(!is_available("inserting"));
         assert!(!is_available("recording"));
         assert!(is_available("error"));
+    }
+
+    fn backend_for_test() -> Backend {
+        let (audio, _audio_receiver) = mpsc::channel();
+        let (inference, _inference_receiver) = mpsc::channel();
+        Backend {
+            snapshot: AppSnapshot {
+                config: default_config(),
+                phase: "starting".into(),
+                error: None,
+                last_transcript: None,
+                live_transcript: None,
+                model_loaded: false,
+            },
+            audio,
+            inference,
+            foreground: 0,
+            shortcut_capture: false,
+            start_cancelled: false,
+        }
+    }
+
+    #[test]
+    fn cancelled_microphone_start_returns_to_idle_after_setup_finishes() {
+        let mut backend = backend_for_test();
+        backend.start_cancelled = true;
+        assert_eq!(
+            apply_start_completion(&mut backend, Ok(())),
+            StartCompletion::Idle
+        );
+        assert_eq!(backend.snapshot.phase, "idle");
+        assert!(backend.snapshot.error.is_none());
+    }
+
+    #[test]
+    fn microphone_start_completion_tracks_success_or_error() {
+        let mut backend = backend_for_test();
+        assert_eq!(
+            apply_start_completion(&mut backend, Ok(())),
+            StartCompletion::Listening
+        );
+        assert_eq!(backend.snapshot.phase, "recording");
+
+        let mut backend = backend_for_test();
+        assert_eq!(
+            apply_start_completion(&mut backend, Err("No microphone is available".into())),
+            StartCompletion::Error
+        );
+        assert_eq!(backend.snapshot.phase, "error");
+        assert_eq!(
+            backend.snapshot.error.as_deref(),
+            Some("No microphone is available")
+        );
     }
 
     #[test]

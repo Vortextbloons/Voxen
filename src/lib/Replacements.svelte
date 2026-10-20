@@ -35,31 +35,44 @@
 	.rows {
 		display: flex;
 		flex-direction: column;
-		gap: 8px;
-		margin-bottom: 10px;
+		gap: 10px;
+		margin-bottom: 12px;
 	}
 
 	.row {
 		display: grid;
 		grid-template-columns: 1fr 1fr auto;
-		gap: 8px;
+		gap: 10px;
 		align-items: end;
 	}
 
 	.cell {
 		display: flex;
 		flex-direction: column;
-		gap: 3px;
+		gap: 5px;
 	}
 
 	.cell > span {
 		font-size: 11.5px;
-		font-weight: 600;
-		color: var(--ink-soft);
+		font-weight: 500;
+		color: var(--ink-faint);
+	}
+
+	.row button {
+		border-color: transparent;
+		background: transparent;
+		color: var(--ink-faint);
+		padding: 7px 8px;
+	}
+
+	.row button:not(:disabled):hover {
+		border-color: transparent;
+		background: transparent;
+		color: var(--danger);
 	}
 
 	.none {
-		color: var(--ink-soft);
+		color: var(--ink-faint);
 		font-size: 12px;
 	}
 

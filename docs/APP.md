@@ -39,6 +39,7 @@ Voxen is a **local Windows dictation** desktop app. You hold or toggle a global 
 | Clipboard backup and restore | Yes (batch paste path) |
 | Phrase replacements | Yes |
 | Text cleanup (Raw / Light / Polished, local model) | Yes |
+| Spoken-number and code normalization (built-in) | Yes |
 | System tray while settings closed | Yes |
 | On-screen dictation indicator | Yes |
 | Sidebar live transcript preview | Yes (`liveTranscript`) |
@@ -205,7 +206,7 @@ Every `dictation-state` event and `get_snapshot` response uses the same shape (c
 | `config` | `Config` | Current settings (see table above) |
 | `phase` | string | One of `idle`, `recording`, `transcribing`, `inserting`, `error` |
 | `error` | string or null | Human-readable message when `phase` is `error` |
-| `lastTranscript` | string or null | Most recent final transcript after replacements (sidebar preview) |
+| `lastTranscript` | string or null | Most recent final transcript after replacements, cleanup, and normalization (sidebar preview) |
 | `liveTranscript` | string or null | Combined final + interim text during recording when the live stream is active; cleared when the utterance finishes |
 | `modelLoaded` | boolean | Whether the inference thread still holds a loaded NeMo recognizer |
 
@@ -237,7 +238,7 @@ During **recording**, Voxen tries to run NeMo’s **streaming** ASR in parallel 
    - **Interim** text is the latest non-final hypothesis for the current phrase.
    - If `foreground != 0`, `insertion::replace_text` revises what is already in the target field (backspace shared prefix, type the suffix, Unicode-aware).
 6. `liveTranscript` in the snapshot is the visible combination of finalized text plus current interim text (for the settings sidebar).
-7. On **stop**, `Transcribe` finishes the stream. If a live session was active, it sets `lastTranscript`, clears `liveTranscript`, and **does not** run batch `insert_text` (the target app already has the text). If live never started, the worker uses one-shot `Recognizer::transcribe` and `insert_text` as before.
+7. On **stop**, `Transcribe` finishes the stream. If a live session was active, it cleans and normalizes the final text, revises the already-typed text when either changed, sets `lastTranscript`, clears `liveTranscript`, and **does not** run batch `insert_text` (the target app already has the text). If live never started, the worker uses one-shot `Recognizer::transcribe` and `insert_text` as before.
 
 Live typing temporarily releases held modifier keys (Ctrl/Shift/Alt/Win), sends keystrokes, then restores modifiers so shortcut chords do not block insertion.
 
@@ -247,15 +248,15 @@ Live typing temporarily releases held modifier keys (Ctrl/Shift/Alt/Win), sends 
 
 ## Text cleanup
 
-Text appears live while speaking in every cleanup mode. After recording stops, Voxen can clean the final transcript with a small local instruction model and replace the already-typed text. Live interim text is never cleaned; only the final transcript is. If streaming is unavailable, cleanup runs after batch transcription.
+Text appears live while speaking in every cleanup mode. After recording stops, Voxen can clean the final transcript with a small local instruction model and replace the already-typed text. Live interim text is never cleaned; only the final transcript is. The final text then passes the deterministic normalizer below in every mode. If streaming is unavailable, cleanup runs after batch transcription.
 
 | Mode | Effect |
 |------|--------|
-| `raw` | No cleanup; transcript is kept unchanged |
+| `raw` | No model cleanup; the deterministic normalizer still runs |
 | `light` | Remove only the filler interjections um/uh and resolve an adjacent same-sentence self-correction (`Tuesday, no wait, Wednesday` → `Wednesday`) |
 | `polished` | Light cleanup plus punctuation, capitalization, sentence splits, and numbered-list markers only when every listed word is kept and no conjunction is dropped |
 
-**Runtime:** Voxen manages a warm local `llama-server` child process (no FFI, no cloud, localhost only). The server starts lazily on the first cleanup with a fixed 2048-token context, reasoning disabled, and greedy decoding, using the configured port only. It makes a single bounded startup attempt (60s); a failed start keeps the original transcript and reports an error. A running server is reused across utterances with no per-call model poll, and stopped when settings are saved, the model is unloaded, or Voxen exits. Changing the cleanup runtime or model path unloads the previous server.
+**Runtime:** Voxen manages a warm local `llama-server` child process (no FFI, no cloud, localhost only). The server starts lazily on the first cleanup with a fixed 2048-token context, reasoning disabled, and greedy decoding, using the configured port only. It makes a single bounded startup attempt (60s); a failed start keeps the original transcript and reports an error. A running server is reused across utterances with no per-call model poll, and stopped when settings are saved, the model is unloaded, Voxen exits, or the idle unload delay expires. When `unloadAfterSeconds` is `0` the model stays loaded but the cleanup server still stops after the default 300 seconds. Changing the cleanup runtime or model path unloads the previous server.
 
 **Pinned setup (verified October 18, 2026):** `llama-server` from the llama.cpp Vulkan backend (2.51.0) with `Qwen3.5-0.8B` rejected as too weak (it either echoed fillers or dropped hedging) and `Qwen3.5-2B-Q4_K_S` (~1.2 GB) pinned instead: it removes fillers, resolves adjacent corrections, and preserves names, numbers, negations, and commands. Set:
 
@@ -263,6 +264,8 @@ Text appears live while speaking in every cleanup mode. After recording stops, V
 - **Cleanup model path** — e.g. `Qwen3.5-2B-Q4_K_S.gguf`
 
 **Safety guard:** every model reply passes an ordered lexical check before it replaces the transcript. Only clear um/uh deletions, narrow comma-delimited edge fillers (er/ah/basically), single-word adjacent same-sentence self-correction resolutions, punctuation/case changes, and numbered-list markers are allowed, and fillers may only be removed, never added; ambiguous phrases (you know, sort of, kind of, like), sentence-initial So, names (Ah, Er), conjunctions (and/or), negations, numbers, symbols, paths, and commands are preserved exactly, including hyphens, slashes, dots, and other symbols inside words. Any other added, dropped, or swapped word (added fillers, extra negations, changed numbers, swapped names or days, cross-sentence or trailing-cue corrections, truncation, hallucinations) rejects the reply. Rejected and failed cleanups keep the original transcript and show a warning in the sidebar (`Cleanup kept the original transcript: …`). Requests are bounded to 2000 input characters with a 30-second timeout; over-long or cut-off replies are rejected the same way.
+
+**Normalization:** after cleanup — and independently of the cleanup mode, including `raw` — the final transcript passes a deterministic local pass with no model calls. It converts spoken numbers and model codes to digits (`three ninety five` → `395`, `ninety nine fifty X` → `9950X`, `M Five` → `M5`, `RTX fifty eighty` → `RTX 5080`, `three hundred ninety five` → `395`, `four oh two` → `402`), attaches a single code letter to an adjacent number (`five K` → `5K`), and collapses an adjacent repeated function word (`a a` → `a`). Number words only convert when the run is unambiguous: lone number words (`three files`), cue-marked times (`at four thirty`, `four thirty am`), comma- or conjunction-separated numbers (`fifty, eighty`), sentence breaks, and repeated pairs (`fifty fifty`) stay as spoken. It runs on the finished utterance only, never on live interim text, and because it runs after the guard the guard rules for model replies are unchanged.
 
 ---
 
@@ -285,7 +288,7 @@ Global shortcut / UI "Test microphone"
         ▼
   stop_recording ──► Transcribe job
         │
-        ├── live session? ──► stream.finish ──► lastTranscript, no batch paste
+        ├── live session? ──► stream.finish ──► cleanup + normalize ──► lastTranscript, no batch paste
         │
         └── else ──► Recognizer::transcribe ──► insert_text (Ctrl+V + clipboard restore)
         │
@@ -390,6 +393,7 @@ The same `index.html` serves the main window and the indicator via query string.
 | `src-tauri/src/lib.rs` | Tauri app, workers, config, commands |
 | `src-tauri/src/nemo.rs` | Dynamic load of `nemo_speech_asr_c.dll`, C ABI bindings, transcribe |
 | `src-tauri/src/cleanup.rs` | Managed `llama-server` child process, bounded chat requests, lexical safety guard |
+| `src-tauri/src/normalize.rs` | Deterministic final-text normalizer (spoken numbers, code letters, duplicated function words) |
 | `src-tauri/src/insertion.rs` | Windows `insert_text` (clipboard + Ctrl+V) and `replace_text` (live Unicode keystrokes) |
 
 ### Tauri IPC commands
@@ -543,6 +547,7 @@ See [AGENTS.md](../AGENTS.md) for editing principles (minimal diffs, no drive-by
 | `transcribing_and_inserting_block_new_recordings` | `lib.rs` | `is_available` only allows `idle` and `error` |
 | `live_edits_only_replace_the_changed_suffix` | `insertion.rs` | Common-prefix logic for live typing |
 | `cleanup` guard tests | `cleanup.rs` | Clear-filler/correction acceptance; conjunction, symbol/number, ambiguous-filler, name, negation, day-swap, cross-sentence-correction, truncation, and hallucination rejection |
+| `normalize` tests | `normalize.rs` | Spoken numbers, scale values, digit pairs, and code letters convert; times, separators, lone number words, and duplicates stay as words |
 | `live_edits_keep_whole_surrogate_pairs` | `insertion.rs` | Unicode surrogate-safe backspace boundaries |
 
 ### Opt-in integration tests
@@ -621,7 +626,7 @@ Not implemented yet; listed for context:
 - Application-specific formatting
 - Performance tuning beyond current idle model retention
 
-Phrase replacements, offline local inference, and the local text cleanup pass are the main post-processing surface today.
+Phrase replacements, the deterministic normalizer, offline local inference, and the local text cleanup pass are the main post-processing surface today.
 
 ---
 
