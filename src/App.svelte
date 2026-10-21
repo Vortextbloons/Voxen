@@ -13,6 +13,7 @@
 	} from './lib/tauri';
 	import { appState } from './lib/state.svelte';
 	import { errorMessage, phaseLabels, type Config } from './lib/types';
+	import { currentVersion, findUpdate, installUpdate, type Update } from './lib/updater';
 	import Indicator from './lib/Indicator.svelte';
 	import Replacements from './lib/Replacements.svelte';
 
@@ -31,13 +32,19 @@
 	let shortcutChosen = $state(false);
 	let previousShortcut = '';
 	let shortcutCaptureRequest: Promise<void> | undefined;
+	let appVersion = $state('');
+	let update = $state<Update | null>(null);
+	let updateStatus = $state<'idle' | 'checking' | 'current' | 'available' | 'installing' | 'error'>('idle');
+	let updateProgress = $state(0);
+	let updateError = $state<string | null>(null);
 
 	const tabs = [
 		{ id: 'microphone', label: 'Microphone' },
 		{ id: 'activation', label: 'Activation' },
 		{ id: 'model', label: 'Model' },
 		{ id: 'cleanup', label: 'Cleanup' },
-		{ id: 'replacements', label: 'Replacements' }
+		{ id: 'replacements', label: 'Replacements' },
+		{ id: 'updates', label: 'Updates' }
 	] as const;
 	type SettingsTab = (typeof tabs)[number]['id'];
 	let activeTab = $state<SettingsTab>('microphone');
@@ -149,6 +156,13 @@
 			} catch (error) {
 				micError = errorMessage(error);
 			}
+			if (disposed) return;
+			try {
+				appVersion = await currentVersion();
+			} catch {
+				appVersion = '';
+			}
+			if (!disposed) void checkUpdates();
 		})();
 		return () => {
 			disposed = true;
@@ -205,6 +219,35 @@
 		}
 	}
 
+	async function checkUpdates() {
+		if (updateStatus === 'checking' || updateStatus === 'installing') return;
+		updateStatus = 'checking';
+		updateError = null;
+		try {
+			const found = await findUpdate();
+			await update?.close();
+			update = found;
+			updateStatus = found ? 'available' : 'current';
+		} catch (error) {
+			update = null;
+			updateStatus = 'error';
+			updateError = errorMessage(error);
+		}
+	}
+
+	async function install() {
+		if (!update) return;
+		updateStatus = 'installing';
+		updateProgress = 0;
+		updateError = null;
+		try {
+			await installUpdate(update, (percent) => (updateProgress = percent));
+		} catch (error) {
+			updateStatus = 'error';
+			updateError = errorMessage(error);
+		}
+	}
+
 	async function save(event: SubmitEvent) {
 		event.preventDefault();
 		if (!draft) return;
@@ -256,6 +299,11 @@
 				<span class="model" data-loaded={modelLoaded}>
 					{modelLoaded ? 'Model loaded' : 'Model not loaded'}
 				</span>
+				{#if updateStatus === 'available' && update}
+					<button type="button" class="update" onclick={() => (activeTab = 'updates')}>
+						Update {update.version} available
+					</button>
+				{/if}
 			</div>
 			<button
 				type="button"
@@ -408,10 +456,47 @@
 								<p class="hint">Path to a small local instruction model file, for example Qwen3.5-2B-Q4_K_S.gguf.</p>
 							</div>
 						</div>
-					{:else}
+					{:else if activeTab === 'replacements'}
 						<div class="group" role="tabpanel" id="panel-replacements" aria-labelledby="tab-replacements">
 							<p class="intro">Words or phrases replaced automatically in every transcription.</p>
 							<Replacements bind:replacements={draft.replacements} />
+						</div>
+					{:else}
+						<div class="group" role="tabpanel" id="panel-updates" aria-labelledby="tab-updates">
+							<p class="intro">Voxen updates itself from GitHub releases. Downloading and installing restarts the app.</p>
+							<div class="field">
+								<span class="label">Installed version</span>
+								<p class="hint">{appVersion || 'Unknown'}</p>
+							</div>
+							{#if updateStatus === 'available' && update}
+								<div class="field">
+									<span class="label">Version {update.version} available</span>
+									{#if update.body}
+										<p class="hint">{update.body}</p>
+									{/if}
+									<button type="button" class="primary" onclick={install}>Download and install</button>
+								</div>
+							{:else if updateStatus === 'installing'}
+								<div class="field">
+									<span class="label">Installing update{updateProgress > 0 ? ` — ${updateProgress}%` : '…'}</span>
+									<progress max="100" value={updateProgress}></progress>
+								</div>
+							{:else if updateStatus === 'checking'}
+								<p class="hint">Checking for updates…</p>
+							{:else if updateStatus === 'current'}
+								<p class="confirm">Voxen is up to date.</p>
+							{:else if updateStatus === 'error'}
+								<p class="error" role="alert">Update check failed: {updateError}</p>
+							{/if}
+							<div class="field">
+								<button
+									type="button"
+									disabled={updateStatus === 'checking' || updateStatus === 'installing'}
+									onclick={checkUpdates}
+								>
+									Check for updates
+								</button>
+							</div>
 						</div>
 					{/if}
 
@@ -545,6 +630,15 @@
 		background: var(--ok);
 	}
 
+	.update {
+		width: fit-content;
+		padding: 4px 9px;
+		font-size: 11.5px;
+		color: var(--accent-cyan);
+		border-color: rgba(47, 180, 255, 0.35);
+		background: rgba(47, 180, 255, 0.08);
+	}
+
 	.record {
 		width: 100%;
 		padding: 9px 12px;
@@ -665,6 +759,11 @@
 
 	.group {
 		padding: 26px 0;
+	}
+
+	.label {
+		font-weight: 500;
+		font-size: 12.5px;
 	}
 
 	.choice {

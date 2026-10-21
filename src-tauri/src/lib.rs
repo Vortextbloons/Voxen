@@ -1083,6 +1083,7 @@ pub fn run() {
     let audio_inference = inference_tx.clone();
     tauri::Builder::default()
         .manage(IndicatorState(Mutex::new(false)))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
             let state = app.state::<AppState>();
             if state.0.lock().unwrap().shortcut_capture { return; }

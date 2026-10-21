@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Voxen desktop capabilities",
   "windows": ["main", "indicator"],
-  "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-show", "core:window:allow-set-focus", "core:tray:default"]
+  "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-show", "core:window:allow-set-focus", "core:tray:default", "updater:default"]
 }

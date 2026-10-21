@@ -8,5 +8,11 @@
     "windows": [{ "label": "main", "title": "Voxen", "width": 900, "height": 680, "theme": "Dark" }],
     "security": { "csp": null }
   },
-  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.png", "icons/icon.ico"] }
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.png", "icons/icon.ico"], "createUpdaterArtifacts": true },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM3MEI5QjIwOTM1NzcxNzYKUldSMmNWZVRJSnNMTitVSnNzbVlJa0M4TGdxRmVyd0FWTXJRc2YxZlhrK0Jicmx1Z3F3bkpKeGQK",
+      "endpoints": ["https://github.com/Vortextbloons/Voxen/releases/latest/download/latest.json"]
+    }
+  }
 }

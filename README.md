@@ -25,6 +25,10 @@
 </p>
 
 <p style="margin: 0;">
+  <a href="https://github.com/Vortextbloons/Voxen/releases/latest">
+    <img src="https://img.shields.io/badge/Download-Windows-16C9FF?style=for-the-badge&logo=windows&logoColor=142343" alt="Download" />
+  </a>
+  &nbsp;
   <img src="https://img.shields.io/badge/Platform-Windows-142343?style=for-the-badge&logo=windows&logoColor=white" alt="Windows" />
   &nbsp;
   <img src="https://img.shields.io/badge/STT-Local_on_device-16C9FF?style=for-the-badge&logo=cpu&logoColor=142343" alt="Local STT" />

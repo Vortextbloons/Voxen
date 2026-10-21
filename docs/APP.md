@@ -42,6 +42,7 @@ Voxen is a **local Windows dictation** desktop app. You hold or toggle a global 
 | Spoken-number and code normalization (built-in) | Yes |
 | System tray while settings closed | Yes |
 | On-screen dictation indicator | Yes |
+| Automatic updates (GitHub releases) | Yes |
 | Sidebar live transcript preview | Yes (`liveTranscript`) |
 | Persisted settings | Yes (`config.json`) |
 | Persisted transcript history | No (RAM only) |
@@ -369,6 +370,7 @@ Mic stream failures post `AudioCommand::Failed` to the audio worker, clear the s
 | `src/lib/Indicator.svelte` | Minimal overlay UI (`?indicator=1`) |
 | `src/lib/Replacements.svelte` | Replacement rows editor |
 | `src/lib/tauri.ts` | `invoke` wrappers and event listener |
+| `src/lib/updater.ts` | GitHub release update check, install, and restart |
 | `src/lib/types.ts` | Shared TypeScript types |
 | `src/lib/state.svelte.ts` | Reactive snapshot store |
 
@@ -381,7 +383,7 @@ The same `index.html` serves the main window and the indicator via query string.
 **Main window layout**
 
 - **Sidebar:** Brand, phase chip, model-loaded indicator, **Test microphone** button, errors, optional **Live** block (`liveTranscript` while streaming), and **Last transcription** (`lastTranscript`).
-- **Content form:** Microphone, Activation (shortcut + hold/toggle), Local model (paths, device, idle unload + **Unload model**), Replacements table, sticky **Save changes**.
+- **Content form:** Microphone, Activation (shortcut + hold/toggle), Local model (paths, device, idle unload + **Unload model**), Cleanup, Replacements, Updates (version, check, download and install), sticky **Save changes**.
 - **Browser-only (`npm run dev`):** Stub card explaining that mic, shortcuts, and tray require `npm run tauri dev`.
 
 **Indicator window** (`190×44`, bottom-center of primary monitor, frameless, always on top, click-through): shows phase label with a colored dot; destroyed when phase returns to `idle` or `error`.
@@ -466,6 +468,9 @@ Model license: [CC-BY-4.0](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) f
 
 ```
 Voxen/
+├── .github/
+│   └── workflows/
+│       └── release.yml   # Tag-triggered Windows release + updater artifacts
 ├── docs/
 │   └── APP.md            # Full application reference (this file)
 ├── src/                  # Svelte frontend
@@ -529,6 +534,27 @@ External (not npm/cargo): NeMo-Speech.cpp runtime DLLs and Parakeet GGUF on disk
 - Main window: 900×680, dark theme
 - `beforeDevCommand`: `npm run dev` at `http://localhost:1420`
 - Tray icon enabled; exit on last window close is **prevented** so tray keeps running
+
+### Releases and updates
+
+Releases are built by GitHub Actions from `.github/workflows/release.yml`. Pushing a `v*` tag builds the NSIS installer plus signed updater artifacts and publishes them as a GitHub release with `latest.json`.
+
+1. Bump `version` in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` (keep all three in sync).
+2. Commit, then push a matching tag:
+   ```powershell
+   git tag v0.2.0
+   git push origin master --tags
+   ```
+3. The workflow publishes `Voxen_<version>_x64-setup.exe`, the updater bundle, and `latest.json`.
+
+Installed copies read `latest.json` from the newest release (`plugins.updater` in `tauri.conf.json`). The **Updates** tab checks on startup and can download, install, and restart into the new version.
+
+Updater signatures use the minisign key at `%USERPROFILE%\.tauri\voxen.key`; the public half is `plugins.updater.pubkey` in `tauri.conf.json`, and CI reads the private half from the `TAURI_SIGNING_PRIVATE_KEY` repository secret. Keep that private key safe: losing it stops updates for existing installs. Local release builds need the same environment variable:
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = "$HOME\.tauri\voxen.key"
+npm run tauri build -- --bundles nsis
+```
 
 ### Agent / contribution notes
 
