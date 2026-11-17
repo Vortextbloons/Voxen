@@ -1,53 +1,61 @@
-mod cleanup;
+pub mod cleanup;
+mod hotkey;
+pub mod indicator;
 mod insertion;
 mod nemo;
 mod normalize;
+pub mod theme;
+pub mod ui;
+pub mod updater;
+pub mod widgets;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rune::{
+    AppHandle, OverlayHandle, Shortcut, ShortcutId, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec,
+};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct Replacement {
-    from: String,
-    to: String,
+pub struct Replacement {
+    pub from: String,
+    pub to: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct Config {
-    microphone: Option<String>,
-    shortcut: String,
-    activation_mode: String,
-    runtime_path: String,
-    model_path: String,
-    device: String,
-    replacements: Vec<Replacement>,
-    unload_after_seconds: u64,
+pub struct Config {
+    pub microphone: Option<String>,
+    pub shortcut: String,
+    pub activation_mode: String,
+    pub runtime_path: String,
+    pub model_path: String,
+    pub device: String,
+    pub replacements: Vec<Replacement>,
+    pub unload_after_seconds: u64,
     #[serde(default)]
-    cleanup_mode: cleanup::Mode,
+    pub cleanup_mode: cleanup::Mode,
     #[serde(default)]
-    cleanup_runtime_path: String,
+    pub cleanup_runtime_path: String,
     #[serde(default)]
-    cleanup_model_path: String,
+    pub cleanup_model_path: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AppSnapshot {
-    config: Config,
-    phase: String,
-    error: Option<String>,
-    last_transcript: Option<String>,
-    live_transcript: Option<String>,
-    model_loaded: bool,
+pub struct AppSnapshot {
+    pub config: Config,
+    pub phase: String,
+    pub error: Option<String>,
+    pub last_transcript: Option<String>,
+    pub live_transcript: Option<String>,
+    pub model_loaded: bool,
 }
 
 struct Backend {
@@ -59,6 +67,10 @@ struct Backend {
     start_cancelled: bool,
     cancellation: Option<Cancellation>,
     submission: Option<insertion::SubmissionObserver>,
+    shortcut_id: Option<ShortcutId>,
+    indicator: Option<OverlayHandle<indicator::Indicator>>,
+    indicator_phase: Option<String>,
+    indicator_visible: bool,
 }
 
 impl Backend {
@@ -101,10 +113,16 @@ impl Cancellation {
     }
 }
 
-struct AppState(Mutex<Backend>);
-struct IndicatorState(Mutex<bool>);
+#[derive(Clone)]
+pub struct Engine {
+    backend: Arc<Mutex<Backend>>,
+    handle: AppHandle<ui::VoxenApp>,
+    revision: Arc<AtomicU64>,
+}
+
 type CapturedAudio = Result<(Vec<f32>, u32), String>;
 const DEFAULT_UNLOAD_SECONDS: u64 = 300;
+const APP_ID: &str = "com.voxen.app";
 
 enum AudioCommand {
     Start(Option<String>, mpsc::Sender<Result<(), String>>),
@@ -131,7 +149,7 @@ struct Live {
     cancellation: Cancellation,
 }
 
-fn default_config() -> Config {
+pub fn default_config() -> Config {
     Config {
         microphone: None,
         shortcut: "Ctrl+Shift+Space".into(),
@@ -186,49 +204,6 @@ fn apply_cleanup(
     }
 }
 
-fn publish(app: &AppHandle) -> AppSnapshot {
-    let snapshot = app.state::<AppState>().0.lock().unwrap().snapshot.clone();
-    let _ = app.emit("dictation-state", &snapshot);
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        update_indicator(&handle);
-    });
-    snapshot
-}
-
-fn build_indicator(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
-    let window = tauri::WebviewWindowBuilder::new(
-        app,
-        "indicator",
-        tauri::WebviewUrl::App("index.html?indicator=1".into()),
-    )
-    .title("Voxen dictation")
-    .inner_size(168.0, 68.0)
-    .transparent(true)
-    .decorations(false)
-    .resizable(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .focused(false)
-    .focusable(false)
-    .visible(false)
-    .build()?;
-    let _ = window.set_ignore_cursor_events(true);
-    Ok(window)
-}
-
-fn position_indicator(window: &tauri::WebviewWindow) {
-    if let Ok(Some(monitor)) = window.primary_monitor() {
-        let scale = monitor.scale_factor();
-        let size = monitor.size();
-        let origin = monitor.position();
-        let _ = window.set_position(tauri::PhysicalPosition::new(
-            origin.x + (size.width as i32 - (168.0 * scale) as i32) / 2,
-            origin.y + size.height as i32 - (108.0 * scale) as i32,
-        ));
-    }
-}
-
 fn indicator_active(phase: &str, starting_cancelled: bool) -> bool {
     match phase {
         "starting" => !starting_cancelled,
@@ -237,55 +212,464 @@ fn indicator_active(phase: &str, starting_cancelled: bool) -> bool {
     }
 }
 
-fn update_indicator(app: &AppHandle) {
-    let indicator = app.state::<IndicatorState>();
-    let mut visible = indicator.0.lock().unwrap();
-    let (phase, starting_cancelled) = {
-        let state = app.state::<AppState>();
-        let backend = state.0.lock().unwrap();
-        (backend.snapshot.phase.clone(), backend.start_cancelled)
-    };
-    if indicator_active(&phase, starting_cancelled) {
-        let window = match app.get_webview_window("indicator") {
-            Some(window) => window,
-            None => match build_indicator(app) {
-                Ok(window) => {
-                    *visible = false;
-                    window
-                }
-                Err(_) => return,
+fn config_dir() -> Result<PathBuf, String> {
+    rune::dirs::AppDirs::new(APP_ID)
+        .map(|dirs| dirs.config().to_path_buf())
+        .ok_or_else(|| "Could not find the application config folder".into())
+}
+
+impl Engine {
+    pub fn new(handle: AppHandle<ui::VoxenApp>) -> Self {
+        let (audio, audio_rx) = mpsc::channel();
+        let (inference, inference_rx) = mpsc::channel();
+        let (config, config_error) = load_config();
+        let snapshot = AppSnapshot {
+            config,
+            phase: if config_error.is_some() {
+                "error".into()
+            } else {
+                "idle".into()
             },
+            error: config_error,
+            last_transcript: None,
+            live_transcript: None,
+            model_loaded: false,
         };
-        if !*visible {
-            position_indicator(&window);
-            if window.show().is_ok() {
-                *visible = true;
+        let engine = Engine {
+            backend: Arc::new(Mutex::new(Backend {
+                snapshot,
+                audio,
+                inference,
+                foreground: 0,
+                shortcut_capture: false,
+                start_cancelled: false,
+                cancellation: None,
+                submission: None,
+                shortcut_id: None,
+                indicator: None,
+                indicator_phase: None,
+                indicator_visible: false,
+            })),
+            handle,
+            revision: Arc::new(AtomicU64::new(0)),
+        };
+        let audio_engine = engine.clone();
+        std::thread::spawn(move || audio_worker(audio_engine, audio_rx));
+        let inference_engine = engine.clone();
+        std::thread::spawn(move || inference_worker(inference_engine, inference_rx));
+        engine
+    }
+
+    pub fn snapshot(&self) -> AppSnapshot {
+        self.backend.lock().unwrap().snapshot.clone()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    pub fn list_microphones() -> Result<Vec<String>, String> {
+        let mut names = cpal::default_host()
+            .input_devices()
+            .map_err(|e| e.to_string())?
+            .map(|device| device.name().map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    pub fn attach_indicator(&self, indicator: OverlayHandle<indicator::Indicator>) {
+        self.backend.lock().unwrap().indicator = Some(indicator);
+    }
+
+    fn publish(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.sync_indicator();
+        self.handle.update(|_, _| {});
+    }
+
+    fn sync_indicator(&self) {
+        let (show, phase, error, phase_changed, visibility_changed) = {
+            let mut backend = self.backend.lock().unwrap();
+            let show = indicator_active(&backend.snapshot.phase, backend.start_cancelled);
+            let phase = backend.snapshot.phase.clone();
+            let error = backend.snapshot.error.is_some();
+            let phase_changed = show && backend.indicator_phase.as_deref() != Some(phase.as_str());
+            let visibility_changed = backend.indicator_visible != show;
+            if show {
+                backend.indicator_phase = Some(phase.clone());
+            } else {
+                backend.indicator_phase = None;
+            }
+            backend.indicator_visible = show;
+            (show, phase, error, phase_changed, visibility_changed)
+        };
+        let indicator = self.backend.lock().unwrap().indicator.clone();
+        let Some(indicator) = indicator else {
+            return;
+        };
+        if visibility_changed {
+            if show {
+                indicator.show();
+            } else {
+                indicator.hide();
             }
         }
-    } else if *visible {
-        if let Some(window) = app.get_webview_window("indicator") {
-            let _ = window.hide();
+        if show && phase_changed {
+            indicator.update(move |state, _| state.set(&phase, error));
         }
-        *visible = false;
+    }
+
+    pub fn report_error(&self, error: String) {
+        {
+            let mut backend = self.backend.lock().unwrap();
+            backend.snapshot.phase = "error".into();
+            backend.snapshot.error = Some(error);
+        }
+        self.publish();
+    }
+
+    pub fn save_config(&self, config: Config) -> Result<AppSnapshot, String> {
+        let shortcut = validate_config(&config)?;
+        let backend = self.backend.lock().unwrap();
+        if !is_available(&backend.snapshot.phase) {
+            return Err("Wait until dictation finishes before changing settings".into());
+        }
+        if backend.shortcut_capture {
+            return Err("Finish selecting the shortcut before saving".into());
+        }
+        let old_shortcut = backend.snapshot.config.shortcut.clone();
+        let old_id = backend.shortcut_id;
+        let changed = config.shortcut != old_shortcut;
+        let registered = old_id.is_some();
+        let directory = config_dir()?;
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let pending = directory.join("config.new");
+        std::fs::write(
+            &pending,
+            serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        drop(backend);
+        let new_id = if changed || !registered {
+            match self.register_shortcut(shortcut) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&pending);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        if changed && registered {
+            if let Some(old_id) = old_id {
+                if let Err(error) = self.handle.unregister_shortcut(old_id) {
+                    if let Some(new_id) = new_id {
+                        let _ = self.handle.unregister_shortcut(new_id);
+                    }
+                    let _ = std::fs::remove_file(&pending);
+                    return Err(error.to_string());
+                }
+            }
+        }
+        if let Err(error) = std::fs::rename(&pending, directory.join("config.json")) {
+            if changed && registered {
+                if let Ok(old) = old_shortcut.parse::<Shortcut>() {
+                    let _ = self.register_shortcut(old);
+                }
+            }
+            if let Some(new_id) = new_id {
+                let _ = self.handle.unregister_shortcut(new_id);
+            }
+            return Err(error.to_string());
+        }
+        {
+            let mut backend = self.backend.lock().unwrap();
+            if let Some(new_id) = new_id {
+                backend.shortcut_id = Some(new_id);
+            }
+            if let Err(error) = backend.inference.send(InferenceCommand::Unload) {
+                return Err(error.to_string());
+            }
+            backend.snapshot.config = config;
+            backend.snapshot.phase = "idle".into();
+            backend.snapshot.error = None;
+        }
+        self.publish();
+        Ok(self.snapshot())
+    }
+
+    fn register_shortcut(&self, shortcut: Shortcut) -> Result<ShortcutId, String> {
+        let label = shortcut.to_string();
+        let owner = self.handle.shortcut_owner(&shortcut);
+        self.handle
+            .register_shortcut(shortcut, |state, tx| state.on_shortcut(tx))
+            .map_err(|error| match error {
+                rune::ShortcutError::Conflict => owner
+                    .map(|owner| format!("{label} is already used by {owner}"))
+                    .unwrap_or_else(|| format!("{label} is already in use")),
+                other => other.to_string(),
+            })
+    }
+
+    pub fn set_shortcut_capture(&self, active: bool) -> Result<(), String> {
+        let mut backend = self.backend.lock().unwrap();
+        if backend.shortcut_capture == active {
+            return Ok(());
+        }
+        if active && !is_available(&backend.snapshot.phase) {
+            return Err("Wait until dictation finishes before changing the shortcut".into());
+        }
+        let shortcut = backend
+            .snapshot
+            .config
+            .shortcut
+            .parse::<Shortcut>()
+            .map_err(|error| error.to_string())?;
+        if active {
+            if let Some(id) = backend.shortcut_id.take() {
+                self.handle
+                    .unregister_shortcut(id)
+                    .map_err(|error| error.to_string())?;
+            }
+        } else if backend.shortcut_id.is_none() {
+            match self.register_shortcut(shortcut) {
+                Ok(id) => backend.shortcut_id = Some(id),
+                Err(error) => {
+                    backend.shortcut_capture = false;
+                    return Err(error);
+                }
+            }
+        }
+        backend.shortcut_capture = active;
+        Ok(())
+    }
+
+    pub fn start_recording(&self) -> Result<(), String> {
+        let (config, foreground, receiver) = {
+            let mut backend = self.backend.lock().unwrap();
+            if !is_available(&backend.snapshot.phase) {
+                return Err("Dictation is already in progress".into());
+            }
+            if backend.snapshot.config.runtime_path.trim().is_empty()
+                || backend.snapshot.config.model_path.trim().is_empty()
+            {
+                return Err("Set and save the local runtime and model paths first".into());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                backend.foreground = foreground_target();
+            }
+            let (tx, rx) = mpsc::channel();
+            backend.finish_session();
+            let cancellation = Cancellation::new();
+            let submission = if backend.foreground != 0 {
+                match insertion::SubmissionObserver::install(backend.foreground, &cancellation) {
+                    Ok(observer) => Some(observer),
+                    Err(error) => {
+                        cancellation.finish();
+                        return Err(format!(
+                            "Keyboard submission protection unavailable: {error}"
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            backend
+                .audio
+                .send(AudioCommand::Start(
+                    backend.snapshot.config.microphone.clone(),
+                    tx,
+                ))
+                .map_err(|error| {
+                    cancellation.finish();
+                    error.to_string()
+                })?;
+            backend.cancellation = Some(cancellation);
+            backend.submission = submission;
+            backend.start_cancelled = false;
+            backend.snapshot.phase = "starting".into();
+            backend.snapshot.error = None;
+            backend.snapshot.live_transcript = None;
+            (backend.snapshot.config.clone(), backend.foreground, rx)
+        };
+        self.publish();
+        let engine = self.clone();
+        std::thread::spawn(move || complete_start(engine, config, foreground, receiver));
+        Ok(())
+    }
+
+    pub fn stop_recording(&self) -> Result<(), String> {
+        let mut backend = self.backend.lock().unwrap();
+        if backend.snapshot.phase == "starting" {
+            backend.start_cancelled = true;
+            drop(backend);
+            self.publish();
+            return Ok(());
+        }
+        if backend.snapshot.phase != "recording" {
+            return Err("Recording is not active".into());
+        }
+        let cancellation = backend
+            .cancellation
+            .clone()
+            .ok_or_else(|| "Recording is not active".to_string())?;
+        let job = (|| {
+            let (tx, rx) = mpsc::channel();
+            backend
+                .audio
+                .send(AudioCommand::Stop(tx))
+                .map_err(|e| e.to_string())?;
+            let (samples, rate) = rx.recv().map_err(|e| e.to_string())??;
+            backend.snapshot.phase = "transcribing".into();
+            Ok::<InferenceCommand, String>(InferenceCommand::Transcribe(
+                backend.snapshot.config.clone(),
+                samples,
+                rate,
+                backend.foreground,
+                cancellation.clone(),
+            ))
+        })();
+        let job = match job {
+            Ok(job) => job,
+            Err(error) => {
+                backend.finish_session();
+                return Err(error);
+            }
+        };
+        drop(backend);
+        self.publish();
+        let result = self.backend.lock().unwrap().inference.send(job);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.backend.lock().unwrap().finish_session();
+                Err(error.to_string())
+            }
+        }
+    }
+
+    pub fn unload_model(&self) -> Result<(), String> {
+        let backend = self.backend.lock().unwrap();
+        if !is_available(&backend.snapshot.phase) {
+            return Err("Wait until dictation finishes before unloading the model".into());
+        }
+        backend
+            .inference
+            .send(InferenceCommand::Unload)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn handle_shortcut(&self) {
+        let (mode, phase, capture) = {
+            let backend = self.backend.lock().unwrap();
+            (
+                backend.snapshot.config.activation_mode.clone(),
+                backend.snapshot.phase.clone(),
+                backend.shortcut_capture,
+            )
+        };
+        if capture {
+            return;
+        }
+        let result = match (mode.as_str(), phase.as_str()) {
+            ("hold", phase) if is_available(phase) => self.start_recording(),
+            ("hold", "starting" | "recording") => self.stop_recording(),
+            ("toggle", "starting" | "recording") => self.stop_recording(),
+            ("toggle", phase) if is_available(phase) => self.start_recording(),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            self.report_error(error);
+        }
+    }
+
+    pub fn shortcut_down(&self) -> bool {
+        let shortcut = self
+            .backend
+            .lock()
+            .unwrap()
+            .snapshot
+            .config
+            .shortcut
+            .clone();
+        hotkey::shortcut_down(&shortcut)
+    }
+
+    pub fn open_window(&self) {
+        self.handle.open();
+    }
+
+    pub fn hide_window(&self) {
+        self.handle.hide();
+    }
+
+    pub fn quit(&self) {
+        self.handle.quit();
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self
+            .backend
+            .lock()
+            .unwrap()
+            .inference
+            .send(InferenceCommand::Unload);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    fn ensure_shortcut(&self) {
+        let shortcut = {
+            let backend = self.backend.lock().unwrap();
+            if backend.shortcut_id.is_some() || backend.shortcut_capture {
+                return;
+            }
+            backend.snapshot.config.shortcut.clone()
+        };
+        let Ok(shortcut) = shortcut.parse::<Shortcut>() else {
+            self.report_error(format!(
+                "Could not register shortcut: invalid binding {shortcut}. Choose another shortcut in settings."
+            ));
+            return;
+        };
+        match self.register_shortcut(shortcut) {
+            Ok(id) => {
+                self.backend.lock().unwrap().shortcut_id = Some(id);
+                self.publish();
+            }
+            Err(error) => self.report_error(format!(
+                "Could not register shortcut: {error}. Choose another shortcut in settings."
+            )),
+        }
     }
 }
 
-fn report_error(app: &AppHandle, error: String) {
-    {
-        let state = app.state::<AppState>();
-        let mut backend = state.0.lock().unwrap();
-        backend.snapshot.phase = "error".into();
-        backend.snapshot.error = Some(error);
+fn load_config() -> (Config, Option<String>) {
+    let Ok(directory) = config_dir() else {
+        return (default_config(), None);
+    };
+    let Ok(contents) = std::fs::read(directory.join("config.json")) else {
+        return (default_config(), None);
+    };
+    match serde_json::from_slice::<Config>(&contents) {
+        Ok(config) if validate_config(&config).is_ok() => (config, None),
+        Ok(_) => (
+            default_config(),
+            Some("Saved settings are invalid. Review and save settings again.".into()),
+        ),
+        Err(error) => (
+            default_config(),
+            Some(format!("Could not read saved settings: {error}")),
+        ),
     }
-    publish(app);
 }
 
-fn audio_worker(
-    app: AppHandle,
-    receiver: mpsc::Receiver<AudioCommand>,
-    sender: mpsc::Sender<AudioCommand>,
-    inference: mpsc::Sender<InferenceCommand>,
-) {
+fn audio_worker(engine: Engine, receiver: mpsc::Receiver<AudioCommand>) {
+    let sender = engine.backend.lock().unwrap().audio.clone();
+    let inference = engine.backend.lock().unwrap().inference.clone();
     let mut stream: Option<cpal::Stream> = None;
     let mut samples = Arc::new(Mutex::new(Vec::<f32>::new()));
     let mut rate = 0;
@@ -393,12 +777,8 @@ fn audio_worker(
                 if stream.take().is_some() {
                     samples.lock().unwrap().clear();
                     forwarded = 0;
-                    {
-                        let state = app.state::<AppState>();
-                        let mut backend = state.0.lock().unwrap();
-                        backend.finish_session();
-                    }
-                    report_error(&app, error);
+                    engine.backend.lock().unwrap().finish_session();
+                    engine.report_error(error);
                 }
             }
             None => {
@@ -443,7 +823,7 @@ fn append_mono(target: &Arc<Mutex<Vec<f32>>>, data: impl Iterator<Item = f32>, c
     }
 }
 
-fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) {
+fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) {
     let mut model: Option<nemo::Recognizer> = None;
     let mut cleaner: Option<cleanup::Cleaner> = None;
     let mut deadline: Option<Instant> = None;
@@ -475,13 +855,8 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                 model = None;
                 cleaner = None;
                 deadline = None;
-                app.state::<AppState>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .snapshot
-                    .model_loaded = false;
-                publish(&app);
+                engine.backend.lock().unwrap().snapshot.model_loaded = false;
+                engine.publish();
             }
             InferenceCommand::UnloadCleanup => {
                 cleaner = None;
@@ -490,12 +865,12 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
             InferenceCommand::StartLive(config, target, cancellation) => {
                 live = None;
                 deadline = None;
-                match start_live(&app, &mut model, &config, target, cancellation) {
+                match start_live(&engine, &mut model, &config, target, cancellation) {
                     Ok(session) => live = Some(session),
                     Err(error) => {
-                        app.state::<AppState>().0.lock().unwrap().snapshot.error =
+                        engine.backend.lock().unwrap().snapshot.error =
                             Some(format!("Live typing is unavailable: {error}"));
-                        publish(&app);
+                        engine.publish();
                     }
                 }
             }
@@ -503,7 +878,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                 if let Some(session) = live.as_mut() {
                     if session.failure.is_none() {
                         match session.stream.push(&samples, rate) {
-                            Ok(()) => pump_live(&app, session),
+                            Ok(()) => pump_live(&engine, session),
                             Err(error) => session.failure = Some(error),
                         }
                     }
@@ -515,7 +890,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                     if let Some(mut session) = live.take() {
                         if session.failure.is_none() {
                             match session.stream.finish() {
-                                Ok(()) => pump_live(&app, &mut session),
+                                Ok(()) => pump_live(&engine, &mut session),
                                 Err(error) => session.failure = Some(error),
                             }
                         }
@@ -527,16 +902,16 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                         };
                         let mut error = error;
                         if error.is_none() {
-                            let (cleaned, warning) = apply_cleanup(&mut cleaner, &config, transcript.clone());
+                            let (cleaned, warning) =
+                                apply_cleanup(&mut cleaner, &config, transcript.clone());
                             cleanup_warning = warning;
                             let cleaned = normalize::normalize(&cleaned);
                             if cleaned != transcript
                                 && session.target != 0
                                 && !session.cancellation.is_cancelled()
                             {
-                                app.state::<AppState>().0.lock().unwrap().snapshot.phase =
-                                    "inserting".into();
-                                publish(&app);
+                                engine.backend.lock().unwrap().snapshot.phase = "inserting".into();
+                                engine.publish();
                                 if let Err(failure) = insertion::replace_text(
                                     session.target,
                                     &session.inserted,
@@ -548,12 +923,12 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                             }
                             transcript = cleaned;
                         }
-                        let state = app.state::<AppState>();
-                        let mut backend = state.0.lock().unwrap();
-                        backend.snapshot.last_transcript = Some(transcript);
-                        backend.snapshot.live_transcript = None;
-                        drop(backend);
-                        publish(&app);
+                        {
+                            let mut backend = engine.backend.lock().unwrap();
+                            backend.snapshot.last_transcript = Some(transcript);
+                            backend.snapshot.live_transcript = None;
+                        }
+                        engine.publish();
                         return match error {
                             Some(error) => Err(error),
                             None => Ok(()),
@@ -565,42 +940,24 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                             &config.model_path,
                             &config.device,
                         )?);
-                        app.state::<AppState>()
-                            .0
-                            .lock()
-                            .unwrap()
-                            .snapshot
-                            .model_loaded = true;
-                        publish(&app);
+                        engine.backend.lock().unwrap().snapshot.model_loaded = true;
+                        engine.publish();
                     }
                     let text = model.as_mut().unwrap().transcribe(&samples, rate)?;
                     let text = apply_replacements(text, &config.replacements);
                     let (text, warning) = apply_cleanup(&mut cleaner, &config, text);
                     cleanup_warning = warning;
                     let text = normalize::normalize(&text);
-                    app.state::<AppState>()
-                        .0
-                        .lock()
-                        .unwrap()
-                        .snapshot
-                        .last_transcript = Some(text.clone());
-                    if !text.trim().is_empty()
-                        && foreground != 0
-                        && !cancellation.is_cancelled()
-                    {
-                        app.state::<AppState>().0.lock().unwrap().snapshot.phase =
-                            "inserting".into();
-                        publish(&app);
+                    engine.backend.lock().unwrap().snapshot.last_transcript = Some(text.clone());
+                    if !text.trim().is_empty() && foreground != 0 && !cancellation.is_cancelled() {
+                        engine.backend.lock().unwrap().snapshot.phase = "inserting".into();
+                        engine.publish();
                         #[cfg(target_os = "windows")]
                         insertion::insert_text(foreground, &text, &cancellation)?;
                     }
                     Ok::<(), String>(())
                 })();
-                {
-                    let state = app.state::<AppState>();
-                    let mut backend = state.0.lock().unwrap();
-                    backend.finish_session();
-                }
+                engine.backend.lock().unwrap().finish_session();
                 unload_model_on_idle = config.unload_after_seconds > 0;
                 deadline = if model.is_some() && (unload_model_on_idle || cleaner.is_some()) {
                     let idle = if unload_model_on_idle {
@@ -614,14 +971,14 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
                 };
                 match result {
                     Ok(()) => {
-                        let state = app.state::<AppState>();
-                        let mut backend = state.0.lock().unwrap();
-                        backend.snapshot.phase = "idle".into();
-                        backend.snapshot.error = cleanup_warning;
-                        drop(backend);
-                        publish(&app);
+                        {
+                            let mut backend = engine.backend.lock().unwrap();
+                            backend.snapshot.phase = "idle".into();
+                            backend.snapshot.error = cleanup_warning;
+                        }
+                        engine.publish();
                     }
-                    Err(error) => report_error(&app, error),
+                    Err(error) => engine.report_error(error),
                 }
             }
         }
@@ -629,7 +986,7 @@ fn inference_worker(app: AppHandle, receiver: mpsc::Receiver<InferenceCommand>) 
 }
 
 fn start_live(
-    app: &AppHandle,
+    engine: &Engine,
     model: &mut Option<nemo::Recognizer>,
     config: &Config,
     target: isize,
@@ -641,13 +998,8 @@ fn start_live(
             &config.model_path,
             &config.device,
         )?);
-        app.state::<AppState>()
-            .0
-            .lock()
-            .unwrap()
-            .snapshot
-            .model_loaded = true;
-        publish(app);
+        engine.backend.lock().unwrap().snapshot.model_loaded = true;
+        engine.publish();
     }
     Ok(Live {
         stream: model.as_ref().unwrap().stream()?,
@@ -661,11 +1013,11 @@ fn start_live(
     })
 }
 
-fn pump_live(app: &AppHandle, session: &mut Live) {
+fn pump_live(engine: &Engine, session: &mut Live) {
     loop {
         match session.stream.next() {
             Ok(Some((transcript, is_final))) => {
-                apply_live(app, session, transcript, is_final);
+                apply_live(engine, session, transcript, is_final);
                 if session.failure.is_some() {
                     break;
                 }
@@ -679,7 +1031,7 @@ fn pump_live(app: &AppHandle, session: &mut Live) {
     }
 }
 
-fn apply_live(app: &AppHandle, session: &mut Live, transcript: String, is_final: bool) {
+fn apply_live(engine: &Engine, session: &mut Live, transcript: String, is_final: bool) {
     let transcript = apply_replacements(transcript, &session.replacements);
     if is_final {
         if !session.text.is_empty() && !transcript.is_empty() {
@@ -706,9 +1058,9 @@ fn apply_live(app: &AppHandle, session: &mut Live, transcript: String, is_final:
         }
     }
     session.visible = visible;
-    app.state::<AppState>().0.lock().unwrap().snapshot.live_transcript =
+    engine.backend.lock().unwrap().snapshot.live_transcript =
         (!session.visible.is_empty()).then_some(session.visible.clone());
-    publish(app);
+    engine.publish();
 }
 
 fn apply_replacements(text: String, replacements: &[Replacement]) -> String {
@@ -754,7 +1106,7 @@ fn apply_start_completion(backend: &mut Backend, result: Result<(), String>) -> 
 }
 
 fn complete_start(
-    app: AppHandle,
+    engine: Engine,
     config: Config,
     foreground: isize,
     receiver: mpsc::Receiver<Result<(), String>>,
@@ -765,8 +1117,7 @@ fn complete_start(
         .and_then(|result| result);
     let started = result.is_ok();
     {
-        let state = app.state::<AppState>();
-        let mut backend = state.0.lock().unwrap();
+        let mut backend = engine.backend.lock().unwrap();
         if started && backend.start_cancelled {
             let (tx, _rx) = mpsc::channel();
             let _ = backend.audio.send(AudioCommand::Stop(tx));
@@ -784,7 +1135,7 @@ fn complete_start(
             backend.finish_session();
         }
     }
-    publish(&app);
+    engine.publish();
 }
 
 fn validate_config(config: &Config) -> Result<Shortcut, String> {
@@ -824,345 +1175,141 @@ fn validate_config(config: &Config) -> Result<Shortcut, String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn get_snapshot(state: State<'_, AppState>) -> AppSnapshot {
-    state.0.lock().unwrap().snapshot.clone()
+#[cfg(target_os = "windows")]
+fn foreground_target() -> isize {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_invalid() {
+        return 0;
+    }
+    let mut process = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut process));
+    }
+    if process == unsafe { GetCurrentProcessId() } {
+        0
+    } else {
+        window.0 as isize
+    }
 }
 
-#[tauri::command]
-fn list_microphones() -> Result<Vec<String>, String> {
-    let mut names = cpal::default_host()
-        .input_devices()
-        .map_err(|e| e.to_string())?
-        .map(|device| device.name().map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    names.sort();
-    names.dedup();
-    Ok(names)
+fn tray_icon() -> Option<TrayIcon> {
+    let bytes = include_bytes!("../icons/icon.png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    buffer.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buffer,
+        png::ColorType::Rgb => buffer
+            .chunks(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buffer
+            .chunks(2)
+            .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+            .collect(),
+        png::ColorType::Grayscale => buffer
+            .iter()
+            .flat_map(|value| [*value, *value, *value, 255])
+            .collect(),
+        png::ColorType::Indexed => return None,
+    };
+    let size = 32u32;
+    let mut small = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        let source_y = y * info.height / size;
+        for x in 0..size {
+            let source_x = x * info.width / size;
+            let index = ((source_y * info.width + source_x) * 4) as usize;
+            small.extend_from_slice(&rgba[index..index + 4]);
+        }
+    }
+    Some(TrayIcon::rgba(size, size, small))
 }
 
-#[tauri::command]
-fn set_shortcut_capture(app: AppHandle, state: State<'_, AppState>, active: bool) -> Result<(), String> {
-    let mut backend = state.0.lock().unwrap();
-    if backend.shortcut_capture == active { return Ok(()); }
-    if active && !is_available(&backend.snapshot.phase) {
-        return Err("Wait until dictation finishes before changing the shortcut".into());
-    }
-    let shortcut = backend.snapshot.config.shortcut.parse::<Shortcut>().map_err(|error| error.to_string())?;
-    if active {
-        if app.global_shortcut().is_registered(shortcut) {
-            app.global_shortcut().unregister(shortcut).map_err(|error| error.to_string())?;
-        }
-    } else if !app.global_shortcut().is_registered(shortcut) {
-        app.global_shortcut().register(shortcut).map_err(|error| error.to_string())?;
-    }
-    backend.shortcut_capture = active;
-    Ok(())
+fn ui_poll(state: &mut ui::VoxenApp, clock: f64, tx: &mut rune::Tx) -> bool {
+    state.poll(clock, tx)
 }
 
-#[tauri::command]
-fn save_config(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    config: Config,
-) -> Result<AppSnapshot, String> {
-    let shortcut = validate_config(&config)?;
-    let mut backend = state.0.lock().unwrap();
-    if !is_available(&backend.snapshot.phase) {
-        return Err("Wait until dictation finishes before changing settings".into());
-    }
-    if backend.shortcut_capture {
-        return Err("Finish selecting the shortcut before saving".into());
-    }
-    let old_shortcut = backend
-        .snapshot
-        .config
-        .shortcut
-        .parse::<Shortcut>()
-        .map_err(|e| e.to_string())?;
-    let changed = shortcut != old_shortcut;
-    let old_registered = app.global_shortcut().is_registered(old_shortcut);
-    let register_new = changed || !old_registered;
-    let directory = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    let pending = directory.join("config.new");
-    std::fs::write(
-        &pending,
-        serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    if register_new {
-        app.global_shortcut()
-            .register(shortcut)
-            .map_err(|e| e.to_string())?;
-    }
-    if changed && old_registered {
-        if let Err(error) = app.global_shortcut().unregister(old_shortcut) {
-            let _ = app.global_shortcut().unregister(shortcut);
-            return Err(error.to_string());
-        }
-    }
-    if let Err(error) = std::fs::rename(&pending, directory.join("config.json")) {
-        if changed && old_registered {
-            let _ = app.global_shortcut().register(old_shortcut);
-        }
-        if register_new {
-            let _ = app.global_shortcut().unregister(shortcut);
-        }
-        return Err(error.to_string());
-    }
-    backend
-        .inference
-        .send(InferenceCommand::Unload)
-        .map_err(|e| e.to_string())?;
-    backend.snapshot.config = config;
-    backend.snapshot.phase = "idle".into();
-    backend.snapshot.error = None;
-    drop(backend);
-    Ok(publish(&app))
+fn ui_key(state: &mut ui::VoxenApp, event: &rune::KeyEvent, tx: &mut rune::Tx) -> bool {
+    state.on_key(event, tx)
 }
 
-#[tauri::command]
-fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let (config, foreground, receiver) = {
-        let mut backend = state.0.lock().unwrap();
-        if !is_available(&backend.snapshot.phase) {
-            return Err("Dictation is already in progress".into());
-        }
-        if backend.snapshot.config.runtime_path.trim().is_empty()
-            || backend.snapshot.config.model_path.trim().is_empty()
-        {
-            return Err("Set and save the local runtime and model paths first".into());
-        }
-        #[cfg(target_os = "windows")]
-        {
-            backend.foreground =
-                unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize };
-            if app
-                .get_webview_window("main")
-                .and_then(|window| window.hwnd().ok())
-                .is_some_and(|hwnd| hwnd.0 as isize == backend.foreground)
-            {
-                backend.foreground = 0;
-            }
-        }
-        let (tx, rx) = mpsc::channel();
-        backend.finish_session();
-        let cancellation = Cancellation::new();
-        let submission = if backend.foreground != 0 {
-            match insertion::SubmissionObserver::install(backend.foreground, &cancellation) {
-                Ok(observer) => Some(observer),
-                Err(error) => {
-                    cancellation.finish();
-                    return Err(format!(
-                        "Keyboard submission protection unavailable: {error}"
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        backend
-            .audio
-            .send(AudioCommand::Start(
-                backend.snapshot.config.microphone.clone(),
-                tx,
-            ))
-            .map_err(|error| {
-                cancellation.finish();
-                error.to_string()
-            })?;
-        backend.cancellation = Some(cancellation);
-        backend.submission = submission;
-        backend.start_cancelled = false;
-        backend.snapshot.phase = "starting".into();
-        backend.snapshot.error = None;
-        backend.snapshot.live_transcript = None;
-        (
-            backend.snapshot.config.clone(),
-            backend.foreground,
-            rx,
+fn start_tray(engine: &Engine, handle: AppHandle<ui::VoxenApp>) {
+    let Some(icon) = tray_icon() else {
+        engine.report_error("Could not load the tray icon".into());
+        return;
+    };
+    let settings = handle.clone();
+    let quit = handle.clone();
+    let tray = Tray::new(
+        TraySpec::new(APP_ID, "Voxen", icon)
+            .tooltip("Voxen — local dictation")
+            .menu(vec![
+                TrayItem::action("settings", "Settings"),
+                TrayItem::action("quit", "Quit"),
+            ]),
+        move |event| match event {
+            TrayEvent::Activate { .. } => settings.open(),
+            TrayEvent::Menu(id) if id == "settings" => settings.open(),
+            TrayEvent::Menu(id) if id == "quit" => quit.quit(),
+            _ => {}
+        },
+    );
+    match tray {
+        Ok(tray) => std::mem::forget(tray),
+        Err(error) => engine.report_error(format!("Could not create the tray icon: {error}")),
+    }
+}
+
+pub fn run() {
+    rune::set_app_id(APP_ID);
+    let _ = rune::set_app_icon(include_bytes!("../icons/icon.png").to_vec());
+    let spec = rune::AppSpec {
+        min_size: Some((720.0, 520.0)),
+        poll: Some(ui_poll),
+        on_key: Some(ui_key),
+        ..rune::AppSpec::new(
+            "Voxen",
+            (900.0, 680.0),
+            || unreachable!("state is built by App::init"),
+            ui::VoxenApp::view,
         )
     };
-    publish(&app);
-    std::thread::spawn(move || complete_start(app, config, foreground, receiver));
-    Ok(())
-}
-
-#[tauri::command]
-fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let mut backend = state.0.lock().unwrap();
-    if backend.snapshot.phase == "starting" {
-        backend.start_cancelled = true;
-        drop(backend);
-        publish(&app);
-        return Ok(());
+    let mut app = rune::App::new(spec)
+        .keep_running()
+        .allow_unmodified_shortcuts()
+        .modifier_keys()
+        .on_close(|state, tx| state.on_close(tx))
+        .on_focus(|state, focused, tx| state.on_focus(focused, tx))
+        .on_quit(|state, _| state.engine.shutdown());
+    let handle = app.handle();
+    let engine = Engine::new(handle.clone());
+    if !rune::is_headless() {
+        let indicator = app.overlay(
+            rune::OverlaySpec {
+                name: "voxen-indicator",
+                size: (220.0, 76.0),
+                edge: rune::ScreenEdge::Bottom,
+                margin: 40.0,
+                align: rune::Align::Center,
+                inset: 0.0,
+                interactive: false,
+                view: indicator::view,
+            },
+            indicator::Indicator::new(),
+        );
+        engine.attach_indicator(indicator);
+        start_tray(&engine, handle.clone());
     }
-    if backend.snapshot.phase != "recording" {
-        return Err("Recording is not active".into());
-    }
-    let cancellation = backend
-        .cancellation
-        .clone()
-        .ok_or_else(|| "Recording is not active".to_string())?;
-    let job = (|| {
-        let (tx, rx) = mpsc::channel();
-        backend
-            .audio
-            .send(AudioCommand::Stop(tx))
-            .map_err(|e| e.to_string())?;
-        let (samples, rate) = rx.recv().map_err(|e| e.to_string())??;
-        backend.snapshot.phase = "transcribing".into();
-        Ok::<InferenceCommand, String>(InferenceCommand::Transcribe(
-            backend.snapshot.config.clone(),
-            samples,
-            rate,
-            backend.foreground,
-            cancellation.clone(),
-        ))
-    })();
-    let job = match job {
-        Ok(job) => job,
-        Err(error) => {
-            backend.finish_session();
-            return Err(error);
-        }
-    };
-    drop(backend);
-    publish(&app);
-    let result = state.0.lock().unwrap().inference.send(job);
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            state.0.lock().unwrap().finish_session();
-            Err(error.to_string())
-        }
-    }
-}
-
-#[tauri::command]
-fn unload_model(state: State<'_, AppState>) -> Result<(), String> {
-    let backend = state.0.lock().unwrap();
-    if !is_available(&backend.snapshot.phase) {
-        return Err("Wait until dictation finishes before unloading the model".into());
-    }
-    backend
-        .inference
-        .send(InferenceCommand::Unload)
-        .map_err(|e| e.to_string())
-}
-
-fn open_settings(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else {
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Ok(builder) =
-                tauri::WebviewWindowBuilder::from_config(&app, &app.config().app.windows[0])
-            {
-                let _ = builder.build();
-            }
-        });
-    }
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    let snapshot = AppSnapshot {
-        config: default_config(),
-        phase: "idle".into(),
-        error: None,
-        last_transcript: None,
-        live_transcript: None,
-        model_loaded: false,
-    };
-    let (audio_tx, audio_rx) = mpsc::channel();
-    let (inference_tx, inference_rx) = mpsc::channel();
-    let audio_inference = inference_tx.clone();
-    tauri::Builder::default()
-        .manage(IndicatorState(Mutex::new(false)))
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, _, event| {
-            let state = app.state::<AppState>();
-            if state.0.lock().unwrap().shortcut_capture { return; }
-            let (mode, phase) = { let backend = state.0.lock().unwrap(); (backend.snapshot.config.activation_mode.clone(), backend.snapshot.phase.clone()) };
-            let result = match (mode.as_str(), event.state) {
-                ("hold", ShortcutState::Pressed) if is_available(&phase) => start_recording(app.clone(), state),
-                ("hold", ShortcutState::Released) if matches!(phase.as_str(), "starting" | "recording") => stop_recording(app.clone(), state),
-                ("toggle", ShortcutState::Pressed) if matches!(phase.as_str(), "starting" | "recording") => stop_recording(app.clone(), state),
-                ("toggle", ShortcutState::Pressed) if is_available(&phase) => start_recording(app.clone(), state),
-                _ => Ok(()),
-            };
-            if let Err(error) = result { report_error(app, error); }
-        }).build())
-        .manage(AppState(Mutex::new(Backend { snapshot, audio: audio_tx.clone(), inference: inference_tx, foreground: 0, shortcut_capture: false, start_cancelled: false, cancellation: None, submission: None })))
-        .setup(move |app| {
-            let handle = app.handle().clone();
-            std::thread::spawn(move || audio_worker(handle, audio_rx, audio_tx, audio_inference));
-            let handle = app.handle().clone();
-            std::thread::spawn(move || inference_worker(handle, inference_rx));
-            let _ = build_indicator(app.handle());
-            if let Ok(directory) = app.path().app_config_dir() {
-                if let Ok(contents) = std::fs::read(directory.join("config.json")) {
-                    match serde_json::from_slice::<Config>(&contents) {
-                        Ok(config) => {
-                            if validate_config(&config).is_ok() { app.state::<AppState>().0.lock().unwrap().snapshot.config = config; }
-                            else { report_error(app.handle(), "Saved settings are invalid. Review and save settings again.".into()); }
-                        }
-                        Err(error) => report_error(app.handle(), format!("Could not read saved settings: {error}")),
-                    }
-                }
-            }
-            let shortcut = app.state::<AppState>().0.lock().unwrap().snapshot.config.shortcut.clone();
-            if let Err(error) = app.global_shortcut().register(shortcut.as_str()) {
-                report_error(app.handle(), format!("Could not register shortcut: {error}. Choose another shortcut in settings."));
-            }
-            let settings = tauri::menu::MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-            let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&settings, &quit])?;
-            let icon = app.default_window_icon().cloned().unwrap_or_else(|| tauri::image::Image::new_owned([36, 88, 197, 255].repeat(32 * 32), 32, 32));
-            tauri::tray::TrayIconBuilder::new().icon(icon).tooltip("Voxen — local dictation").menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "settings" => open_settings(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                }).build(app)?;
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if matches!(event, tauri::WindowEvent::Focused(false) | tauri::WindowEvent::CloseRequested { .. }) {
-                    let app = window.app_handle();
-                    if let Err(error) = set_shortcut_capture(app.clone(), app.state::<AppState>(), false) {
-                        report_error(app, error);
-                    }
-                }
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let window = window.clone();
-                    tauri::async_runtime::spawn(async move { let _ = window.destroy(); });
-                }
-            }
-        })
-        .invoke_handler(tauri::generate_handler![get_snapshot, list_microphones, save_config, set_shortcut_capture, start_recording, stop_recording, unload_model])
-        .build(tauri::generate_context!())
-        .expect("error while building Voxen")
-        .run(|app, event| match event {
-            tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
-            tauri::RunEvent::Exit => {
-                let _ = app
-                    .state::<AppState>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .inference
-                    .send(InferenceCommand::Unload);
-                std::thread::sleep(Duration::from_millis(300));
-            }
-            _ => {}
-        });
+    let startup = engine.clone();
+    handle.update(move |_, _| startup.ensure_shortcut());
+    let init_engine = engine.clone();
+    app = app.init(move || ui::VoxenApp::new(init_engine));
+    app.run();
 }
 
 #[cfg(test)]
@@ -1199,6 +1346,37 @@ mod tests {
         assert!(is_available("error"));
     }
 
+    #[test]
+    fn cleanup_requires_a_mode_and_both_paths() {
+        let mut config = default_config();
+        config.cleanup_runtime_path = "C:\\runtime".into();
+        config.cleanup_model_path = "C:\\cleanup.gguf".into();
+        assert!(!cleanup_enabled(&config));
+        config.cleanup_mode = cleanup::Mode::Light;
+        assert!(cleanup_enabled(&config));
+        config.cleanup_model_path = String::new();
+        assert!(!cleanup_enabled(&config));
+    }
+
+    #[test]
+    fn selecting_a_cleanup_mode_requires_cleanup_paths() {
+        let mut config = default_config();
+        config.cleanup_mode = cleanup::Mode::Polished;
+        assert!(validate_config(&config).is_err());
+        config.cleanup_runtime_path = "C:\\runtime".into();
+        config.cleanup_model_path = "C:\\cleanup.gguf".into();
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn indicator_visibility_follows_the_phase() {
+        assert!(indicator_active("recording", false));
+        assert!(indicator_active("transcribing", false));
+        assert!(!indicator_active("idle", false));
+        assert!(indicator_active("starting", false));
+        assert!(!indicator_active("starting", true));
+    }
+
     fn backend_for_test() -> Backend {
         let (audio, _audio_receiver) = mpsc::channel();
         let (inference, _inference_receiver) = mpsc::channel();
@@ -1218,6 +1396,10 @@ mod tests {
             start_cancelled: false,
             cancellation: None,
             submission: None,
+            shortcut_id: None,
+            indicator: None,
+            indicator_phase: None,
+            indicator_visible: false,
         }
     }
 
@@ -1263,36 +1445,5 @@ mod tests {
             backend.snapshot.error.as_deref(),
             Some("No microphone is available")
         );
-    }
-
-    #[test]
-    fn cleanup_requires_a_mode_and_both_paths() {
-        let mut config = default_config();
-        config.cleanup_runtime_path = "C:\\runtime".into();
-        config.cleanup_model_path = "C:\\cleanup.gguf".into();
-        assert!(!cleanup_enabled(&config));
-        config.cleanup_mode = cleanup::Mode::Light;
-        assert!(cleanup_enabled(&config));
-        config.cleanup_model_path = String::new();
-        assert!(!cleanup_enabled(&config));
-    }
-
-    #[test]
-    fn selecting_a_cleanup_mode_requires_cleanup_paths() {
-        let mut config = default_config();
-        config.cleanup_mode = cleanup::Mode::Polished;
-        assert!(validate_config(&config).is_err());
-        config.cleanup_runtime_path = "C:\\runtime".into();
-        config.cleanup_model_path = "C:\\cleanup.gguf".into();
-        assert!(validate_config(&config).is_ok());
-    }
-
-    #[test]
-    fn cleanup_preserves_the_original_when_disabled_or_empty() {
-        let mut cleaner = None;
-        let config = default_config();
-        let (text, warning) = apply_cleanup(&mut cleaner, &config, "hello there".into());
-        assert_eq!(text, "hello there");
-        assert_eq!(warning, None);
     }
 }

@@ -13,28 +13,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
 
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
 
-      - run: npm ci
+      - id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"' -List).Matches[0].Groups[1].Value
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
-      - uses: tauri-apps/tauri-action@v0
+      - shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $path = "src-tauri/Cargo.toml"
+          $content = Get-Content $path -Raw
+          $content = $content -replace '(?m)^version = "[^"]+"', "version = `"$env:VERSION`""
+          Set-Content -Path $path -Value $content -NoNewline
+
+      - run: cargo build --release --manifest-path src-tauri/Cargo.toml
+
+      - shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "voxen-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "src-tauri/target/release/voxen.exe" (Join-Path $stage "Voxen.exe")
+          Copy-Item "README.md" (Join-Path $stage "README.md")
+          Copy-Item (Join-Path $stage "Voxen.exe") "Voxen.exe"
+          $zip = "Voxen_${env:VERSION}_x64.zip"
+          Compress-Archive -Path (Join-Path $stage "Voxen.exe"), (Join-Path $stage "README.md") -DestinationPath $zip -Force
+          $sums = @("Voxen.exe", $zip) | ForEach-Object {
+            "$((Get-FileHash -Algorithm SHA256 -Path $_).Hash.ToLower())  $_"
+          }
+          Set-Content -Path "SHA256SUMS.txt" -Value $sums -Encoding ascii
+
+      - uses: softprops/action-gh-release@v2
         with:
-          tagName: v__VERSION__
-          releaseName: Voxen v__VERSION__
-          releaseBody: Download the installer below. Voxen updates itself from the latest release.
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-          args: --bundles nsis
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Voxen v${{ steps.version.outputs.version }}
+          body: Download Voxen.exe or the zip below. Voxen updates itself from the latest release. The updater is unsigned; Windows may warn about the downloaded executable.
+          files: |
+            Voxen.exe
+            Voxen_${{ steps.version.outputs.version }}_x64.zip
+            SHA256SUMS.txt
+          fail_on_unmatched_files: true

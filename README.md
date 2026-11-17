@@ -35,7 +35,7 @@
   &nbsp;
   <img src="https://img.shields.io/badge/Cloud-None-5789FF?style=for-the-badge&logo=shield&logoColor=white" alt="No cloud" />
   &nbsp;
-  <img src="https://img.shields.io/badge/Stack-Tauri_·_Rust-A42DFF?style=for-the-badge&logo=tauri&logoColor=white" alt="Tauri + Rust" />
+  <img src="https://img.shields.io/badge/Stack-Rune_·_Rust-A42DFF?style=for-the-badge&logo=rust&logoColor=white" alt="Rune + Rust" />
 </p>
 
 </td>
@@ -179,6 +179,6 @@ Dictation into the app that already has focus
 
 <br /><br />
 
-<sub style="color: #8899bb;">Svelte 5 · Tauri 2 · Rust · Parakeet TDT v3 · NeMo-Speech.cpp</sub>
+<sub style="color: #8899bb;">Rune · Rust · Parakeet TDT v3 · NeMo-Speech.cpp</sub>
 
 </div>

@@ -3,6 +3,8 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 runtime/
+bench/models.json
+packaging/out/
 AGENTS.md
 
 # Local environment files

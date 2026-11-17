@@ -1,0 +1,1 @@
+Remove only the filler words um and uh and fix punctuation and capitalization. Keep every other word exactly as spoken. Return only the cleaned text.

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
@@ -82,9 +82,22 @@ impl Cleaner {
     }
 
     pub fn clean(&mut self, text: &str, mode: Mode) -> Result<String, String> {
+        let candidate = self.clean_unguarded(text, mode)?;
+        if mode == Mode::Raw {
+            return Ok(candidate);
+        }
+        guard(text.trim(), &candidate)?;
+        Ok(candidate)
+    }
+
+    pub fn clean_unguarded(&mut self, text: &str, mode: Mode) -> Result<String, String> {
         if mode == Mode::Raw {
             return Ok(text.to_string());
         }
+        self.clean_with_prompt(text, system_prompt(mode))
+    }
+
+    pub fn clean_with_prompt(&mut self, text: &str, system: &str) -> Result<String, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err("The transcript was empty".into());
@@ -97,7 +110,7 @@ impl Cleaner {
         let max_tokens = (words * 2 + 16).clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS);
         let body = serde_json::json!({
             "messages": [
-                {"role": "system", "content": system_prompt(mode)},
+                {"role": "system", "content": system},
                 {"role": "user", "content": text},
             ],
             "max_tokens": max_tokens,
@@ -132,7 +145,6 @@ impl Cleaner {
         if candidate.is_empty() {
             return Err("The cleaned transcript was empty".into());
         }
-        guard(text, &candidate)?;
         Ok(candidate)
     }
 

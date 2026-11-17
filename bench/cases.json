@@ -1,0 +1,88 @@
+{
+  "cases": [
+    {
+      "id": "1",
+      "name": "messy everyday dictation",
+      "tests": "filler removal, punctuation, preserving casual phrasing",
+      "raw": "Um okay so I was looking at the thing yesterday and uh I think we should probably just leave it how it is for now because honestly I'm not really sure if changing it is gonna make anything better",
+      "expected": "Okay, so I was looking at the thing yesterday, and I think we should probably just leave it how it is for now because, honestly, I'm not really sure if changing it is gonna make anything better."
+    },
+    {
+      "id": "2",
+      "name": "changing a recipient mid-sentence",
+      "tests": "resolving a correction without removing the original recipient from a separate instruction",
+      "raw": "Hey can you send that over to Jake tomorrow no wait send it to Marcus tomorrow morning and uh make sure Jake is copied on it too",
+      "expected": "Hey, can you send that over to Marcus tomorrow morning and make sure Jake is copied on it too?"
+    },
+    {
+      "id": "3",
+      "name": "numbers that must not be rewritten",
+      "tests": "numeric self-corrections while preserving the spoken representation of other numbers",
+      "raw": "Uh the price should be fifteen dollars no wait fifty dollars per month and the setup fee is still one hundred and twenty five dollars",
+      "expected": "The price should be fifty dollars per month, and the setup fee is still one hundred and twenty five dollars."
+    },
+    {
+      "id": "4",
+      "name": "uncertainty that must remain",
+      "tests": "not inventing certainty or rewriting the speaker's reasoning",
+      "raw": "Um I think the issue might be with the database but I'm not completely sure because it was working yesterday and uh I haven't checked the logs yet",
+      "expected": "I think the issue might be with the database, but I'm not completely sure because it was working yesterday, and I haven't checked the logs yet."
+    },
+    {
+      "id": "5",
+      "name": "multiple corrections in one sentence",
+      "tests": "resolving several corrections in sequence",
+      "raw": "So let's schedule it for Tuesday no wait Wednesday at two actually no wait Wednesday at three and uh make sure everyone gets the invite",
+      "expected": "So let's schedule it for Wednesday at three, and make sure everyone gets the invite."
+    },
+    {
+      "id": "6",
+      "name": "technical dictation",
+      "tests": "technical accuracy, preservation of negation, and avoiding unauthorized deletion of repeated words",
+      "raw": "Okay so uh when the request comes in check if the token is expired and if it is then return a 401 but don't automatically refresh it because we uh we haven't implemented that part yet",
+      "expected": "Okay, so when the request comes in, check if the token is expired, and if it is, then return a 401. But don't automatically refresh it because we we haven't implemented that part yet."
+    },
+    {
+      "id": "7",
+      "name": "spoken correction inside technical instructions",
+      "tests": "correcting one configuration value without modifying another",
+      "raw": "Set the timeout to thirty seconds no wait sixty seconds and uh keep the retry count at three because anything higher might cause issues",
+      "expected": "Set the timeout to sixty seconds and keep the retry count at three because anything higher might cause issues."
+    },
+    {
+      "id": "8",
+      "name": "casual message with unnecessary fillers",
+      "tests": "preserving personality, frustration, and the word like rather than overly formalizing the message",
+      "raw": "Dude um I genuinely don't understand why this keeps happening like every time I fix one thing something else breaks and uh it's actually getting pretty annoying",
+      "expected": "Dude, I genuinely don't understand why this keeps happening. Like, every time I fix one thing, something else breaks, and it's actually getting pretty annoying."
+    },
+    {
+      "id": "9",
+      "name": "important negative instruction",
+      "tests": "preserving both negative instructions and their rationale",
+      "raw": "Uh don't delete the old files after the migration finishes because we still need them for testing and um don't overwrite the backup either",
+      "expected": "Don't delete the old files after the migration finishes because we still need them for testing, and don't overwrite the backup either."
+    },
+    {
+      "id": "10",
+      "name": "a phrase that looks like a correction but isn't",
+      "tests": "recognizing that I mean is meaningful here, not a self-correction marker",
+      "raw": "I mean what I said yesterday and uh I don't want anyone changing the requirements without talking to me first",
+      "expected": "I mean what I said yesterday, and I don't want anyone changing the requirements without talking to me first."
+    },
+    {
+      "id": "11",
+      "name": "quoted filler word",
+      "tests": "preserving an um that is explicitly part of quoted content, while removing the unrelated filler",
+      "raw": "The recording literally starts with the words um I don't know and uh I want that exact quote included in the report",
+      "expected": "The recording literally starts with the words \"um, I don't know,\" and I want that exact quote included in the report."
+    },
+    {
+      "id": "12",
+      "name": "long messy multi-condition thought",
+      "tests": "long-range coherence, explicit correction, dependency preservation, and informal wording",
+      "raw": "Okay so um I was thinking about the update and I think we should release it tomorrow no wait Friday because uh we still need to test the login stuff and I don't wanna push it out before that's done but if everything passes by Thursday then Friday should be fine",
+      "expected": "Okay, so I was thinking about the update, and I think we should release it Friday because we still need to test the login stuff, and I don't wanna push it out before that's done. But if everything passes by Thursday, then Friday should be fine."
+    }
+  ]
+}
