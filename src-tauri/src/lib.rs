@@ -1,7 +1,9 @@
 pub mod cleanup;
+pub mod context;
 mod hotkey;
 pub mod indicator;
 mod insertion;
+mod library;
 mod nemo;
 mod normalize;
 pub mod theme;
@@ -45,6 +47,12 @@ pub struct Config {
     pub cleanup_runtime_path: String,
     #[serde(default)]
     pub cleanup_model_path: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+    #[serde(default)]
+    pub context_mode: context::Mode,
+    #[serde(default)]
+    pub excluded_apps: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -65,6 +73,7 @@ struct Backend {
     foreground: isize,
     shortcut_capture: bool,
     start_cancelled: bool,
+    context: Option<String>,
     cancellation: Option<Cancellation>,
     submission: Option<insertion::SubmissionObserver>,
     shortcut_id: Option<ShortcutId>,
@@ -78,6 +87,7 @@ impl Backend {
         if let Some(cancellation) = self.cancellation.take() {
             cancellation.finish();
         }
+        self.context = None;
         drop(self.submission.take());
     }
 }
@@ -131,16 +141,25 @@ enum AudioCommand {
 }
 
 enum InferenceCommand {
-    Transcribe(Config, Vec<f32>, u32, isize, Cancellation),
+    Transcribe(
+        Config,
+        Vec<f32>,
+        u32,
+        isize,
+        Option<String>,
+        Cancellation,
+    ),
     Unload,
+    UnloadAck(mpsc::Sender<()>),
     UnloadCleanup,
-    StartLive(Config, isize, Cancellation),
+    StartLive(Config, isize, Option<String>, Cancellation),
     LiveAudio(Vec<f32>, u32),
 }
 
 struct Live {
     stream: nemo::Stream,
     replacements: Vec<Replacement>,
+    context: Option<String>,
     target: isize,
     text: String,
     visible: String,
@@ -162,7 +181,14 @@ pub fn default_config() -> Config {
         cleanup_mode: cleanup::Mode::Raw,
         cleanup_runtime_path: String::new(),
         cleanup_model_path: String::new(),
+        language: default_language(),
+        context_mode: context::Mode::Off,
+        excluded_apps: vec![],
     }
+}
+
+fn default_language() -> String {
+    "auto".into()
 }
 
 fn cleanup_enabled(config: &Config) -> bool {
@@ -171,10 +197,16 @@ fn cleanup_enabled(config: &Config) -> bool {
         && !config.cleanup_model_path.trim().is_empty()
 }
 
+fn context_useful(config: &Config) -> bool {
+    config.context_mode.enabled()
+        && (cleanup_enabled(config) || nemo::supports_boost(&config.model_path))
+}
+
 fn apply_cleanup(
     cleaner: &mut Option<cleanup::Cleaner>,
     config: &Config,
     text: String,
+    context: Option<&str>,
 ) -> (String, Option<String>) {
     if !cleanup_enabled(config) || text.trim().is_empty() {
         return (text, None);
@@ -194,7 +226,7 @@ fn apply_cleanup(
     match cleaner
         .as_mut()
         .unwrap()
-        .clean(text.trim(), config.cleanup_mode)
+        .clean_with_context(text.trim(), config.cleanup_mode, context)
     {
         Ok(cleaned) => (cleaned, None),
         Err(error) => (
@@ -243,6 +275,7 @@ impl Engine {
                 foreground: 0,
                 shortcut_capture: false,
                 start_cancelled: false,
+                context: None,
                 cancellation: None,
                 submission: None,
                 shortcut_id: None,
@@ -279,6 +312,10 @@ impl Engine {
         Ok(names)
     }
 
+    pub(crate) fn list_devices(runtime_path: &str) -> Result<Vec<nemo::Device>, String> {
+        nemo::list_devices(runtime_path)
+    }
+
     pub fn attach_indicator(&self, indicator: OverlayHandle<indicator::Indicator>) {
         self.backend.lock().unwrap().indicator = Some(indicator);
     }
@@ -286,11 +323,11 @@ impl Engine {
     fn publish(&self) {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.sync_indicator();
-        self.handle.update(|_, _| {});
+        self.handle.wake();
     }
 
     fn sync_indicator(&self) {
-        let (show, phase, error, phase_changed, visibility_changed) = {
+        let (show, phase, error, phase_changed, visibility_changed, indicator) = {
             let mut backend = self.backend.lock().unwrap();
             let show = indicator_active(&backend.snapshot.phase, backend.start_cancelled);
             let phase = backend.snapshot.phase.clone();
@@ -303,9 +340,15 @@ impl Engine {
                 backend.indicator_phase = None;
             }
             backend.indicator_visible = show;
-            (show, phase, error, phase_changed, visibility_changed)
+            (
+                show,
+                phase,
+                error,
+                phase_changed,
+                visibility_changed,
+                backend.indicator.clone(),
+            )
         };
-        let indicator = self.backend.lock().unwrap().indicator.clone();
         let Some(indicator) = indicator else {
             return;
         };
@@ -496,6 +539,19 @@ impl Engine {
             backend.snapshot.live_transcript = None;
             (backend.snapshot.config.clone(), backend.foreground, rx)
         };
+        let context = if context_useful(&config) {
+            context::capture(
+                foreground,
+                config.context_mode,
+                &config.excluded_apps,
+            )
+        } else {
+            None
+        };
+        {
+            let mut backend = self.backend.lock().unwrap();
+            backend.context = context;
+        }
         self.publish();
         let engine = self.clone();
         std::thread::spawn(move || complete_start(engine, config, foreground, receiver));
@@ -530,6 +586,7 @@ impl Engine {
                 samples,
                 rate,
                 backend.foreground,
+                backend.context.clone(),
                 cancellation.clone(),
             ))
         })();
@@ -561,6 +618,33 @@ impl Engine {
             .inference
             .send(InferenceCommand::Unload)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_managed_model(&self, path: &str) -> Result<(), String> {
+        self.unload_and_wait()?;
+        std::fs::remove_file(path).map_err(|error| format!("Could not remove the model: {error}"))
+    }
+
+    pub fn remove_managed_runtime(&self, path: &str) -> Result<(), String> {
+        self.unload_and_wait()?;
+        std::fs::remove_dir_all(path)
+            .map_err(|error| format!("Could not remove the runtime: {error}"))
+    }
+
+    fn unload_and_wait(&self) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let backend = self.backend.lock().unwrap();
+            if !is_available(&backend.snapshot.phase) {
+                return Err("Wait until dictation finishes before removing files".into());
+            }
+            backend
+                .inference
+                .send(InferenceCommand::UnloadAck(tx))
+                .map_err(|e| e.to_string())?;
+        }
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "The model did not unload in time".to_string())
     }
 
     pub fn handle_shortcut(&self) {
@@ -858,14 +942,23 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                 engine.backend.lock().unwrap().snapshot.model_loaded = false;
                 engine.publish();
             }
+            InferenceCommand::UnloadAck(reply) => {
+                live = None;
+                model = None;
+                cleaner = None;
+                deadline = None;
+                engine.backend.lock().unwrap().snapshot.model_loaded = false;
+                engine.publish();
+                let _ = reply.send(());
+            }
             InferenceCommand::UnloadCleanup => {
                 cleaner = None;
                 deadline = None;
             }
-            InferenceCommand::StartLive(config, target, cancellation) => {
+            InferenceCommand::StartLive(config, target, context, cancellation) => {
                 live = None;
                 deadline = None;
-                match start_live(&engine, &mut model, &config, target, cancellation) {
+                match start_live(&engine, &mut model, &config, target, context, cancellation) {
                     Ok(session) => live = Some(session),
                     Err(error) => {
                         engine.backend.lock().unwrap().snapshot.error =
@@ -884,7 +977,14 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                     }
                 }
             }
-            InferenceCommand::Transcribe(config, samples, rate, foreground, cancellation) => {
+            InferenceCommand::Transcribe(
+                config,
+                samples,
+                rate,
+                foreground,
+                context,
+                cancellation,
+            ) => {
                 let mut cleanup_warning: Option<String> = None;
                 let result = (|| {
                     if let Some(mut session) = live.take() {
@@ -902,8 +1002,12 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                         };
                         let mut error = error;
                         if error.is_none() {
-                            let (cleaned, warning) =
-                                apply_cleanup(&mut cleaner, &config, transcript.clone());
+                            let (cleaned, warning) = apply_cleanup(
+                                &mut cleaner,
+                                &config,
+                                transcript.clone(),
+                                session.context.as_deref(),
+                            );
                             cleanup_warning = warning;
                             let cleaned = normalize::normalize(&cleaned);
                             if cleaned != transcript
@@ -939,13 +1043,22 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                             &config.runtime_path,
                             &config.model_path,
                             &config.device,
+                            &config.language,
                         )?);
                         engine.backend.lock().unwrap().snapshot.model_loaded = true;
                         engine.publish();
                     }
-                    let text = model.as_mut().unwrap().transcribe(&samples, rate)?;
+                    let terms = context
+                        .as_deref()
+                        .map(context::terms)
+                        .unwrap_or_default();
+                    let text = model
+                        .as_mut()
+                        .unwrap()
+                        .transcribe(&samples, rate, &terms)?;
                     let text = apply_replacements(text, &config.replacements);
-                    let (text, warning) = apply_cleanup(&mut cleaner, &config, text);
+                    let (text, warning) =
+                        apply_cleanup(&mut cleaner, &config, text, context.as_deref());
                     cleanup_warning = warning;
                     let text = normalize::normalize(&text);
                     engine.backend.lock().unwrap().snapshot.last_transcript = Some(text.clone());
@@ -990,6 +1103,7 @@ fn start_live(
     model: &mut Option<nemo::Recognizer>,
     config: &Config,
     target: isize,
+    context: Option<String>,
     cancellation: Cancellation,
 ) -> Result<Live, String> {
     if model.is_none() {
@@ -997,13 +1111,20 @@ fn start_live(
             &config.runtime_path,
             &config.model_path,
             &config.device,
+            &config.language,
         )?);
         engine.backend.lock().unwrap().snapshot.model_loaded = true;
         engine.publish();
     }
     Ok(Live {
-        stream: model.as_ref().unwrap().stream()?,
+        stream: model.as_ref().unwrap().stream(
+            &context
+                .as_deref()
+                .map(context::terms)
+                .unwrap_or_default(),
+        )?,
         replacements: config.replacements.clone(),
+        context,
         target,
         text: String::new(),
         visible: String::new(),
@@ -1125,11 +1246,14 @@ fn complete_start(
         let completion = apply_start_completion(&mut backend, result);
         if completion == StartCompletion::Listening {
             if let Some(cancellation) = backend.cancellation.clone() {
-                let _ = backend.inference.send(InferenceCommand::StartLive(
-                    config,
-                    foreground,
-                    cancellation,
-                ));
+                if nemo::supports_streaming(&config.model_path) {
+                    let _ = backend.inference.send(InferenceCommand::StartLive(
+                        config,
+                        foreground,
+                        backend.context.clone(),
+                        cancellation,
+                    ));
+                }
             }
         } else {
             backend.finish_session();
@@ -1150,6 +1274,31 @@ fn validate_config(config: &Config) -> Result<Shortcut, String> {
             .is_none()
     {
         return Err("Device must be vulkan:<index> or cpu".into());
+    }
+    if nemo::language_code(&config.language).is_none() {
+        return Err("Choose a language supported by the installed speech model".into());
+    }
+    let model_path = config.model_path.to_lowercase();
+    if model_path.contains("parakeet-tdt") && !nemo::parakeet_supports(&config.language) {
+        return Err("Parakeet TDT v3 does not support the selected language".into());
+    }
+    if model_path.contains("nemotron-speech-streaming-en")
+        && !nemo::english_supports(&config.language)
+    {
+        return Err("The Nemotron English model supports English only".into());
+    }
+    if model_path.contains("nemotron-3.5") && !nemo::nemotron_supports(&config.language) {
+        return Err(
+            "Nemotron 3.5 does not offer the selected locale out of the box; choose Parakeet or another locale"
+                .into(),
+        );
+    }
+    if config
+        .excluded_apps
+        .iter()
+        .any(|application| application.trim().is_empty())
+    {
+        return Err("Excluded application names cannot be empty".into());
     }
     if config.unload_after_seconds > 86_400 {
         return Err(
@@ -1281,6 +1430,7 @@ pub fn run() {
     };
     let mut app = rune::App::new(spec)
         .keep_running()
+        .release_gpu_when_closed()
         .allow_unmodified_shortcuts()
         .modifier_keys()
         .on_close(|state, tx| state.on_close(tx))
@@ -1359,6 +1509,20 @@ mod tests {
     }
 
     #[test]
+    fn context_is_only_captured_when_it_can_be_used() {
+        let mut config = default_config();
+        config.context_mode = context::Mode::Nearby;
+        config.model_path = "C:\\models\\nemotron-speech-streaming-en-0.6b.q8_0.gguf".into();
+        assert!(!context_useful(&config));
+        config.cleanup_mode = cleanup::Mode::Light;
+        config.cleanup_runtime_path = "C:\\runtime".into();
+        config.cleanup_model_path = "C:\\cleanup.gguf".into();
+        assert!(context_useful(&config));
+        config.context_mode = context::Mode::Off;
+        assert!(!context_useful(&config));
+    }
+
+    #[test]
     fn selecting_a_cleanup_mode_requires_cleanup_paths() {
         let mut config = default_config();
         config.cleanup_mode = cleanup::Mode::Polished;
@@ -1394,6 +1558,7 @@ mod tests {
             foreground: 0,
             shortcut_capture: false,
             start_cancelled: false,
+            context: None,
             cancellation: None,
             submission: None,
             shortcut_id: None,

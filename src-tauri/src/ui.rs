@@ -1,7 +1,9 @@
+use crate::library::{self, Artifact, Kind, Library, ModelId, MODELS};
+use crate::nemo;
 use crate::theme::{self, Palette, HAIRLINE, RADIUS, SIDEBAR_WIDTH};
 use crate::updater::{UpdateStatus, Updater};
 use crate::widgets::{self, Tone};
-use crate::{cleanup, AppSnapshot, Config, Engine, Replacement};
+use crate::{cleanup, context, AppSnapshot, Config, Engine, Replacement};
 use rune::{col, el, row, text, Cursor, El, Key, KeyEvent, LoopSpec, ScrollSpec, TextEdit, Tx};
 use std::time::Duration;
 
@@ -33,6 +35,7 @@ struct Fields {
     unload: TextEdit,
     cleanup_runtime: TextEdit,
     cleanup_model: TextEdit,
+    excluded_apps: TextEdit,
 }
 
 impl Fields {
@@ -44,6 +47,7 @@ impl Fields {
             unload: TextEdit::new(config.unload_after_seconds.to_string()),
             cleanup_runtime: TextEdit::new(config.cleanup_runtime_path.clone()),
             cleanup_model: TextEdit::new(config.cleanup_model_path.clone()),
+            excluded_apps: TextEdit::new(config.excluded_apps.join(", ")),
         }
     }
 }
@@ -70,19 +74,34 @@ pub struct VoxenApp {
     shortcut_previous: String,
     shortcut_error: Option<String>,
     updater: Updater,
+    library: Library,
+    selected_model: ModelId,
+    devices: Vec<nemo::Device>,
+    device_error: Option<String>,
+    device_rx: Option<std::sync::mpsc::Receiver<(Vec<nemo::Device>, Option<String>)>>,
+    revision: u64,
     loaded: bool,
 }
 
 impl VoxenApp {
     pub fn new(engine: Engine) -> Self {
         let snapshot = engine.snapshot();
+        let revision = engine.revision();
         let (microphones, microphone_error) = match Engine::list_microphones() {
             Ok(names) => (names, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         let draft = snapshot.config.clone();
+        let (device_tx, device_rx) = std::sync::mpsc::channel();
+        let runtime_path = draft.runtime_path.clone();
+        std::thread::spawn(move || {
+            let _ = device_tx.send(detect_devices(&runtime_path));
+        });
         let fields = Fields::from_config(&draft);
         let replacements = replacement_rows(&draft);
+        let library = Library::new();
+        let selected_model =
+            library::model_from_path(&draft.model_path).unwrap_or(ModelId::Multilingual);
         let mut updater = Updater::new();
         updater.check();
         Self {
@@ -102,6 +121,15 @@ impl VoxenApp {
             shortcut_previous: String::new(),
             shortcut_error: None,
             updater,
+            library,
+            selected_model,
+            devices: vec![nemo::Device {
+                id: "cpu".into(),
+                label: "CPU".into(),
+            }],
+            device_error: None,
+            device_rx: Some(device_rx),
+            revision,
             loaded: true,
         }
     }
@@ -147,20 +175,50 @@ impl VoxenApp {
             tx.quit();
             return true;
         }
-        let snapshot = self.engine.snapshot();
-        if snapshot.config != self.snapshot.config {
-            self.apply(snapshot);
+        let (library_changed, completed) = self.library.poll();
+        if library_changed {
             changed = true;
-        } else {
-            if snapshot.phase != self.snapshot.phase
-                || snapshot.error != self.snapshot.error
-                || snapshot.last_transcript != self.snapshot.last_transcript
-                || snapshot.live_transcript != self.snapshot.live_transcript
-                || snapshot.model_loaded != self.snapshot.model_loaded
-            {
-                changed = true;
+        }
+        if let Some(kind) = completed {
+            self.installed(kind);
+            changed = true;
+        }
+        if self.library.runtime.busy()
+            || self.library.models.iter().any(|artifact| artifact.busy())
+        {
+            tx.wake_after(Duration::from_millis(250));
+        }
+        if self.device_rx.is_some() {
+            match self.device_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok((devices, error))) => {
+                    self.set_devices(devices, error);
+                    self.device_rx = None;
+                    changed = true;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    tx.wake_after(Duration::from_millis(25));
+                }
+                _ => self.device_rx = None,
             }
-            self.snapshot = snapshot;
+        }
+        let revision = self.engine.revision();
+        if revision != self.revision {
+            self.revision = revision;
+            let snapshot = self.engine.snapshot();
+            if snapshot.config != self.snapshot.config {
+                self.apply(snapshot);
+                changed = true;
+            } else {
+                if snapshot.phase != self.snapshot.phase
+                    || snapshot.error != self.snapshot.error
+                    || snapshot.last_transcript != self.snapshot.last_transcript
+                    || snapshot.live_transcript != self.snapshot.live_transcript
+                    || snapshot.model_loaded != self.snapshot.model_loaded
+                {
+                    changed = true;
+                }
+                self.snapshot = snapshot;
+            }
         }
         if matches!(self.snapshot.phase.as_str(), "starting" | "recording")
             && self.snapshot.config.activation_mode == "hold"
@@ -584,6 +642,293 @@ impl VoxenApp {
     }
 
     fn model_panel(&self, p: &Palette) -> El {
+        panel_shell("model", "Model library")
+            .child(widgets::intro(
+                p,
+                "Speech recognition runs locally on this machine. Install the official NVIDIA runtime and a matching model here, or point Voxen at files you already have under Advanced manual setup.",
+            ))
+            .child(self.language_field(p))
+            .child(self.device_field(p))
+            .child(self.runtime_card(p))
+            .child(self.model_choice(p))
+            .child(self.model_card(p))
+            .child(self.sample_card(p))
+            .child(self.advanced_model(p))
+    }
+
+    fn language_field(&self, p: &Palette) -> El {
+        let mut list = col()
+            .key("language-list")
+            .role("listbox")
+            .label("Language")
+            .gap(4.0)
+            .w_full()
+            .max_h(156.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .scroll_edge_fade(6.0)
+            .focus_group()
+            .focus_selected(true);
+        for (code, label) in nemo::LANGUAGES {
+            let selected = self.draft.language == *code;
+            let value = *code;
+            list = list.child(
+                widgets::option(p, label, selected)
+                    .on_press(move |s: &mut VoxenApp| s.choose_language(value)),
+            );
+        }
+        field(
+            p,
+            "Language",
+            list,
+            Some("Nemotron 3.5 covers 32 production locales. Greek, Latvian, Lithuanian, Maltese, and Slovenian are Parakeet-only here; other adaptation-only locales are not offered. Parakeet detects its 25 languages offline."),
+        )
+    }
+
+    fn device_field(&self, p: &Palette) -> El {
+        let mut list = col()
+            .key("device-list")
+            .role("listbox")
+            .label("Compute device")
+            .gap(4.0)
+            .w_full()
+            .focus_group()
+            .focus_selected(true);
+        for device in &self.devices {
+            let selected = self.fields.device.text == device.id;
+            let id = device.id.clone();
+            list = list.child(
+                widgets::option(p, &device.label, selected)
+                    .on_press(move |s: &mut VoxenApp| s.choose_device(id.clone())),
+            );
+        }
+        let mut refresh =
+            widgets::button(p, "Refresh devices", Tone::Secondary, true).self_start();
+        refresh = refresh.on_press(|s: &mut VoxenApp| s.refresh_devices());
+        let mut group = col()
+            .gap(6.0)
+            .child(list)
+            .child(refresh)
+            .child(widgets::hint(
+                p,
+                "Vulkan devices need a working Vulkan 1.1+ driver. The managed runtime is the Vulkan build; CPU mode works without a dedicated GPU but is slower.",
+            ));
+        if let Some(error) = &self.device_error {
+            group = group.child(widgets::hint(
+                p,
+                &format!("Devices could not be detected: {error}"),
+            ));
+        }
+        let selected = self.fields.device.text.trim();
+        if selected.starts_with("vulkan:")
+            && !self.devices.iter().any(|device| device.id == selected)
+        {
+            group = group.child(widgets::hint(
+                p,
+                &format!("{selected} was not detected. Choose a listed device or keep it as a manual override."),
+            ));
+        }
+        field(p, "Compute device", group, None)
+    }
+
+    fn runtime_card(&self, p: &Palette) -> El {
+        let artifact = &self.library.runtime;
+        let mut card = widgets::card(p)
+            .child(widgets::eyebrow(p, "Recognition runtime"))
+            .child(
+                text(format!(
+                    "NeMo-Speech.cpp {} · Vulkan x86_64 · {} · {}",
+                    library::RUNTIME_VERSION,
+                    library::size_label(library::RUNTIME_BYTES),
+                    library::RUNTIME_LICENSE
+                ))
+                .font(theme::SMALL)
+                .color(p.ink_soft)
+                .wrap(),
+            )
+            .child(widgets::small(
+                p,
+                &format!("License: {} · {}", library::RUNTIME_LICENSE, library::RUNTIME_LICENSE_URL),
+            ));
+        card = artifact_state(p, card, artifact);
+        if !self.fields.runtime.text.trim().is_empty()
+            && self.fields.runtime.text.trim() != artifact.path.to_string_lossy().as_ref()
+        {
+            card = card.child(widgets::hint(
+                p,
+                "A manual runtime is configured below. This card manages the downloaded copy.",
+            ));
+        }
+        let mut actions = row().gap(8.0).center_y();
+        if artifact.busy() {
+        } else if artifact.ready {
+            if self.idle() {
+                actions = actions.child(
+                    widgets::button(p, "Remove managed runtime", Tone::Secondary, true)
+                        .on_press(|s: &mut VoxenApp| s.remove_runtime()),
+                );
+            }
+        } else {
+            actions = actions.child(
+                widgets::button(p, "Download runtime", Tone::Primary, true)
+                    .on_press(|s: &mut VoxenApp| s.install_runtime()),
+            );
+        }
+        card.child(actions)
+    }
+
+    fn model_choice(&self, p: &Palette) -> El {
+        let mut list = col()
+            .key("model-choice")
+            .role("radiogroup")
+            .label("Speech model")
+            .gap(8.0)
+            .w_full()
+            .focus_group()
+            .focus_selected(true);
+        for spec in MODELS {
+            let selected = self.selected_model == spec.id;
+            let id = spec.id;
+            list = list.child(
+                widgets::choice(p, spec.label, spec.detail, selected)
+                    .on_press(move |s: &mut VoxenApp| s.choose_model(id)),
+            );
+        }
+        field(
+            p,
+            "Speech model",
+            list,
+            Some("Nemotron models stream live; Parakeet is offline only. Use Nemotron English for English-only dictation and Nemotron 3.5 for the other supported locales."),
+        )
+    }
+
+    fn model_card(&self, p: &Palette) -> El {
+        let spec = library::model_spec(self.selected_model);
+        let artifact = self.library.model(spec.id);
+        let path = artifact.path.to_string_lossy().to_string();
+        let current = self.fields.model.text.trim() == path.as_str();
+        let mut card = widgets::card(p)
+            .child(widgets::eyebrow(p, "Selected model"))
+            .child(
+                text(format!("{} · Q8_0 · {}", spec.label, library::size_label(spec.bytes)))
+                    .font(theme::BODY)
+                    .color(p.ink)
+                    .wrap(),
+            )
+            .child(widgets::small(p, spec.detail))
+            .child(widgets::small(
+                p,
+                &format!("License: {} · {}", spec.license, spec.license_url),
+            ));
+        card = artifact_state(p, card, artifact);
+        if current {
+            card = card.child(widgets::status(p, "In use."));
+        } else if !self.fields.model.text.trim().is_empty() {
+            card = card.child(widgets::hint(
+                p,
+                "A manual model is configured below. This card manages the downloaded copy.",
+            ));
+        }
+        if spec.id == ModelId::Parakeet && !nemo::parakeet_supports(&self.draft.language) {
+            card = card.child(widgets::hint(
+                p,
+                "Parakeet does not support this language. Choose the multilingual Nemotron model.",
+            ));
+        }
+        if !spec.streaming {
+            card = card.child(widgets::hint(
+                p,
+                "No live typing with this model. The transcript inserts after you stop recording.",
+            ));
+        }
+        if !spec.boosting {
+            let reason = if spec.id == ModelId::Parakeet {
+                "Parakeet TDT does not support NVIDIA word boosting."
+            } else {
+                "This pinned GGUF has no embedded SentencePiece tokenizer, so NVIDIA word boosting cannot use technical context."
+            };
+            card = card.child(widgets::hint(
+                p,
+                &format!(
+                    "{reason} With Light or Polished cleanup, context is only a limited spelling and casing reference; Raw mode reads no context."
+                ),
+            ));
+        }
+        if spec.id == ModelId::English && !nemo::english_supports(&self.draft.language) {
+            card = card.child(widgets::hint(
+                p,
+                "This English model does not support the selected language. Choose the multilingual Nemotron model.",
+            ));
+        }
+        if spec.id == ModelId::Multilingual && !nemo::nemotron_supports(&self.draft.language) {
+            card = card.child(widgets::hint(
+                p,
+                "Nemotron 3.5 does not offer this locale out of the box. Choose Parakeet for this language.",
+            ));
+        }
+        let mut actions = row().gap(8.0).center_y();
+        if artifact.busy() {
+        } else if artifact.ready {
+            if !current {
+                actions = actions.child(
+                    widgets::button(p, "Use this model", Tone::Primary, true)
+                        .on_press(move |s: &mut VoxenApp| s.use_model(spec.id)),
+                );
+            }
+            if self.idle() {
+                actions = actions.child(
+                    widgets::button(p, "Remove managed model", Tone::Secondary, true)
+                        .on_press(move |s: &mut VoxenApp| s.remove_model(spec.id)),
+                );
+            }
+        } else {
+            actions = actions.child(
+                widgets::button(p, "Download model", Tone::Primary, true)
+                    .on_press(move |s: &mut VoxenApp| s.install_model(spec.id)),
+            );
+        }
+        card.child(actions)
+    }
+
+    fn sample_card(&self, p: &Palette) -> El {
+        let complete = self
+            .snapshot
+            .last_transcript
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty());
+        let mut card = widgets::card(p)
+            .child(widgets::eyebrow(p, "Sample dictation"))
+            .child(widgets::hint(
+                p,
+                "Use Test microphone, say one sentence, and stop. The transcript stays in the sidebar and is not inserted into another app.",
+            ));
+        card = if complete {
+            card.child(widgets::status(
+                p,
+                "Dictation completed. Setup is ready for the global shortcut.",
+            ))
+        } else {
+            card.child(widgets::hint(p, "Waiting for a completed sample."))
+        };
+        let mut test = widgets::button(
+            p,
+            record_label(&self.snapshot.phase),
+            if self.snapshot.phase == "recording" {
+                Tone::Danger
+            } else {
+                Tone::Primary
+            },
+            self.record_enabled(),
+        )
+        .self_start();
+        if self.record_enabled() {
+            test = test.on_press(|s: &mut VoxenApp| s.toggle_recording());
+        }
+        card.child(test)
+    }
+
+    fn advanced_model(&self, p: &Palette) -> El {
         let runtime = field_input(
             p,
             &self.fields.runtime,
@@ -631,10 +976,14 @@ impl VoxenApp {
             unload_button = unload_button.on_press(|s: &mut VoxenApp| s.unload_model());
         }
         unload = unload.child(unload_button);
-        panel_shell("model", "Model")
-            .child(widgets::intro(
+        col()
+            .key("advanced-model")
+            .gap(18.0)
+            .w_full()
+            .child(widgets::eyebrow(p, "Advanced manual setup"))
+            .child(widgets::hint(
                 p,
-                "Speech recognition runs locally on this machine. Point Voxen at your speech runtime and a model file on disk.",
+                "Use these paths for an existing runtime or model, a custom device, or a runtime downloaded elsewhere. Managed installs fill them automatically.",
             ))
             .child(field(
                 p,
@@ -647,7 +996,7 @@ impl VoxenApp {
                 p,
                 "Device",
                 device,
-                Some("Device identifier used by the runtime, for example cpu or vulkan:0 for an RX9060XT."),
+                Some("Device identifier used by the runtime, for example cpu or vulkan:0."),
             ))
             .child(unload)
     }
@@ -687,6 +1036,53 @@ impl VoxenApp {
                     .on_press(move |s: &mut VoxenApp| s.set_cleanup_mode(mode)),
             );
         }
+        let mut context_modes = col().gap(8.0);
+        for (mode, title, description) in [
+            (
+                context::Mode::Off,
+                "Off",
+                "Read nothing from the target application.",
+            ),
+            (
+                context::Mode::Selection,
+                "Selected text",
+                "Use only explicitly selected text as context.",
+            ),
+            (
+                context::Mode::Nearby,
+                "Selected or nearby text",
+                "Use selected text, or up to 400 characters either side of the caret when nothing is selected.",
+            ),
+        ] {
+            let selected = self.draft.context_mode == mode;
+            context_modes = context_modes.child(
+                widgets::choice(p, title, description, selected)
+                    .on_press(move |s: &mut VoxenApp| s.set_context_mode(mode)),
+            );
+        }
+        let excluded = field_input(
+            p,
+            &self.fields.excluded_apps,
+            "context-exclusions",
+            "KeePassXC.exe, 1Password.exe",
+            |s: &mut VoxenApp| &mut s.fields.excluded_apps,
+        );
+        let context = col()
+            .key("technical-context")
+            .gap(10.0)
+            .w_full()
+            .child(widgets::eyebrow(p, "Technical context"))
+            .child(widgets::hint(
+                p,
+                "Read once with Windows accessibility when recording starts, before the indicator appears. Context is bounded to 800 characters, skipped in password fields, and never uses screenshots, clipboard access, or cloud requests. Word hints require NVIDIA's tokenizer-equipped Nemotron 3.5 GGUF; the pinned Nemotron English GGUF has no embedded tokenizer and Parakeet TDT has no word boosting, so Raw mode reads no context with either. With Light or Polished cleanup, context is only a limited spelling and casing reference: the cleanup guard preserves every word, so it can adjust capitalization and punctuation but cannot replace a misspelled word or introduce a technical term.",
+            ))
+            .child(context_modes)
+            .child(field(
+                p,
+                "Excluded applications",
+                excluded,
+                Some("Comma-separated executable names. These apps are skipped before any context is read."),
+            ));
         panel_shell("cleanup", "Cleanup")
             .child(widgets::intro(
                 p,
@@ -705,6 +1101,7 @@ impl VoxenApp {
                 model,
                 Some("Path to a small local instruction model file, for example Qwen3.5-2B-Q4_K_S.gguf."),
             ))
+            .child(context)
     }
 
     fn replacements_panel(&self, p: &Palette) -> El {
@@ -932,6 +1329,169 @@ impl VoxenApp {
         self.saved = false;
     }
 
+    fn set_context_mode(&mut self, mode: context::Mode) {
+        self.draft.context_mode = mode;
+        self.saved = false;
+    }
+
+    fn choose_language(&mut self, language: &'static str) {
+        self.draft.language = language.to_string();
+        let supported = match self.selected_model {
+            ModelId::Multilingual => nemo::nemotron_supports(language),
+            ModelId::English => nemo::english_supports(language),
+            ModelId::Parakeet => nemo::parakeet_supports(language),
+        };
+        if !supported {
+            self.selected_model =
+                if nemo::parakeet_supports(language) && !nemo::nemotron_supports(language) {
+                    ModelId::Parakeet
+                } else {
+                    ModelId::Multilingual
+                };
+        }
+        self.saved = false;
+    }
+
+    fn choose_model(&mut self, model: ModelId) {
+        self.selected_model = model;
+    }
+
+    fn choose_device(&mut self, device: String) {
+        self.fields.device = TextEdit::new(device.clone());
+        self.draft.device = device;
+        self.saved = false;
+    }
+
+    fn idle(&self) -> bool {
+        matches!(self.snapshot.phase.as_str(), "idle" | "error")
+    }
+
+    fn refresh_devices(&mut self) {
+        let (devices, error) = detect_devices(self.fields.runtime.text.trim());
+        self.set_devices(devices, error);
+    }
+
+    fn set_devices(&mut self, devices: Vec<nemo::Device>, error: Option<String>) {
+        self.devices = devices;
+        self.device_error = error;
+        if !self
+            .devices
+            .iter()
+            .any(|device| device.id == self.fields.device.text.trim())
+        {
+            let device = self
+                .devices
+                .iter()
+                .find(|device| device.id.starts_with("vulkan:"))
+                .map(|device| device.id.clone())
+                .unwrap_or_else(|| "cpu".into());
+            self.choose_device(device);
+        }
+    }
+
+    fn install_runtime(&mut self) {
+        self.action_error = None;
+        let _ = self.engine.unload_model();
+        self.library.install(Kind::Runtime);
+    }
+
+    fn install_model(&mut self, model: ModelId) {
+        self.action_error = None;
+        let _ = self.engine.unload_model();
+        self.library.install(Kind::Model(model));
+    }
+
+    fn use_model(&mut self, model: ModelId) {
+        self.selected_model = model;
+        let path = self.library.model(model).path.to_string_lossy().to_string();
+        self.fields.model = TextEdit::new(path.clone());
+        self.draft.model_path = path;
+        self.saved = false;
+        self.action_error = None;
+        if self.idle() {
+            self.save();
+        }
+    }
+
+    fn installed(&mut self, kind: Kind) {
+        let path = match kind {
+            Kind::Runtime => &self.library.runtime.path,
+            Kind::Model(id) => &self.library.model(id).path,
+        }
+        .to_string_lossy()
+        .to_string();
+        match kind {
+            Kind::Runtime => {
+                self.fields.runtime = TextEdit::new(path.clone());
+                self.draft.runtime_path = path;
+                self.refresh_devices();
+                if let Some(device) = self
+                    .devices
+                    .iter()
+                    .find(|device| device.id.starts_with("vulkan:"))
+                {
+                    self.choose_device(device.id.clone());
+                }
+            }
+            Kind::Model(id) => {
+                self.selected_model = id;
+                self.fields.model = TextEdit::new(path.clone());
+                self.draft.model_path = path;
+            }
+        }
+        self.saved = false;
+        self.action_error = None;
+        if self.idle() {
+            self.save();
+        } else {
+            self.save_error =
+                Some("Installed. Save changes after the current dictation finishes.".into());
+        }
+    }
+
+    fn remove_runtime(&mut self) {
+        self.action_error = None;
+        let path = self.library.runtime.path.to_string_lossy().to_string();
+        match self.engine.remove_managed_runtime(&path) {
+            Ok(()) => {
+                self.library.mark_missing(Kind::Runtime);
+                if self.fields.runtime.text.trim() == path.as_str() {
+                    self.fields.runtime = TextEdit::new("");
+                    self.draft.runtime_path.clear();
+                }
+                self.refresh_devices();
+                self.saved = false;
+                if self.idle() {
+                    self.save();
+                }
+            }
+            Err(error) => {
+                self.action_error = Some(format!(
+                    "{error}. Restart Voxen before removing a runtime that is in use."
+                ));
+            }
+        }
+    }
+
+    fn remove_model(&mut self, model: ModelId) {
+        self.action_error = None;
+        let path = self.library.model(model).path.to_string_lossy().to_string();
+        match self.engine.remove_managed_model(&path) {
+            Ok(()) => {
+                self.library.mark_missing(Kind::Model(model));
+                if self.fields.model.text.trim() == path.as_str() {
+                    self.fields.model = TextEdit::new("");
+                    self.draft.model_path.clear();
+                }
+                self.saved = false;
+                if self.idle() {
+                    self.save();
+                }
+            }
+            Err(error) => self.action_error = Some(error),
+        }
+    }
+
     fn add_replacement(&mut self) {
         self.replacements.push(ReplacementRow {
             from: TextEdit::new(""),
@@ -968,6 +1528,15 @@ impl VoxenApp {
         config.unload_after_seconds = unload_after_seconds;
         config.cleanup_runtime_path = self.fields.cleanup_runtime.text.clone();
         config.cleanup_model_path = self.fields.cleanup_model.text.clone();
+        config.excluded_apps = self
+            .fields
+            .excluded_apps
+            .text
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
         config.replacements = self
             .replacements
             .iter()
@@ -1005,6 +1574,39 @@ impl VoxenApp {
 
 fn mods_empty(mods: rune::Mods) -> bool {
     !mods.ctrl && !mods.alt && !mods.shift && !mods.logo
+}
+
+fn detect_devices(runtime_path: &str) -> (Vec<nemo::Device>, Option<String>) {
+    let cpu = nemo::Device {
+        id: "cpu".into(),
+        label: "CPU".into(),
+    };
+    if runtime_path.trim().is_empty() {
+        return (vec![cpu], None);
+    }
+    match Engine::list_devices(runtime_path) {
+        Ok(devices) if !devices.is_empty() => (devices, None),
+        Ok(_) => (vec![cpu], None),
+        Err(error) => (vec![cpu], Some(error)),
+    }
+}
+
+fn artifact_state(p: &Palette, mut card: El, artifact: &Artifact) -> El {
+    if let Some(phase) = &artifact.phase {
+        card = card
+            .child(widgets::label(p, phase))
+            .child(widgets::progress(p, artifact.progress));
+    } else if artifact.ready {
+        card = card
+            .child(widgets::status(p, "Managed copy installed and ready."))
+            .child(widgets::small(p, &artifact.path.display().to_string()));
+    } else {
+        card = card.child(widgets::hint(p, "Managed copy not installed."));
+    }
+    if let Some(error) = &artifact.error {
+        card = card.child(widgets::error(p, error));
+    }
+    card
 }
 
 fn replacement_rows(config: &Config) -> Vec<ReplacementRow> {

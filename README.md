@@ -179,6 +179,6 @@ Dictation into the app that already has focus
 
 <br /><br />
 
-<sub style="color: #8899bb;">Rune · Rust · Parakeet TDT v3 · NeMo-Speech.cpp</sub>
+<sub style="color: #8899bb;">Rune · Rust · Nemotron ASR · NeMo-Speech.cpp</sub>
 
 </div>

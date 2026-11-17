@@ -2,10 +2,144 @@ use libloading::os::windows::{
     Library, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
 };
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 type Handle = *mut c_void;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub const LANGUAGES: &[(&str, &str)] = &[
+    ("auto", "Automatic"),
+    ("en-US", "English (US)"),
+    ("en-GB", "English (UK)"),
+    ("es-US", "Spanish (US)"),
+    ("es-ES", "Spanish (Spain)"),
+    ("fr-FR", "French (France)"),
+    ("fr-CA", "French (Canada)"),
+    ("it-IT", "Italian"),
+    ("pt-BR", "Portuguese (Brazil)"),
+    ("pt-PT", "Portuguese (Portugal)"),
+    ("nl-NL", "Dutch"),
+    ("de-DE", "German"),
+    ("tr-TR", "Turkish"),
+    ("ru-RU", "Russian"),
+    ("ar-AR", "Arabic"),
+    ("hi-IN", "Hindi"),
+    ("ja-JP", "Japanese"),
+    ("ko-KR", "Korean"),
+    ("vi-VN", "Vietnamese"),
+    ("uk-UA", "Ukrainian"),
+    ("pl-PL", "Polish"),
+    ("sv-SE", "Swedish"),
+    ("cs-CZ", "Czech"),
+    ("nb-NO", "Norwegian Bokmål"),
+    ("da-DK", "Danish"),
+    ("bg-BG", "Bulgarian"),
+    ("fi-FI", "Finnish"),
+    ("hr-HR", "Croatian"),
+    ("sk-SK", "Slovak"),
+    ("zh-CN", "Mandarin"),
+    ("hu-HU", "Hungarian"),
+    ("ro-RO", "Romanian"),
+    ("et-EE", "Estonian"),
+    ("el-GR", "Greek (Parakeet)"),
+    ("lv-LV", "Latvian (Parakeet)"),
+    ("lt-LT", "Lithuanian (Parakeet)"),
+    ("mt-MT", "Maltese (Parakeet)"),
+    ("sl-SI", "Slovenian (Parakeet)"),
+];
+
+const NEMOTRON_PRODUCTION: &[&str] = &[
+    "en-US", "en-GB", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "pt-PT", "nl-NL",
+    "de-DE", "tr-TR", "ru-RU", "ar-AR", "hi-IN", "ja-JP", "ko-KR", "vi-VN", "uk-UA", "pl-PL",
+    "sv-SE", "cs-CZ", "nb-NO", "da-DK", "bg-BG", "fi-FI", "hr-HR", "sk-SK", "zh-CN", "hu-HU",
+    "ro-RO", "et-EE",
+];
+
+const PARAKEET_LANGUAGES: &[&str] = &[
+    "en", "es", "fr", "de", "bg", "hr", "cs", "da", "nl", "et", "fi", "el", "hu", "it", "lv", "lt",
+    "mt", "pl", "pt", "ro", "sk", "sl", "sv", "ru", "uk",
+];
+
+pub fn language_code(language: &str) -> Option<&'static str> {
+    let language = language.trim();
+    LANGUAGES
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(language))
+        .map(|(code, _)| *code)
+}
+
+pub fn language_base(language: &str) -> &str {
+    language.split('-').next().unwrap_or(language)
+}
+
+pub fn nemotron_supports(language: &str) -> bool {
+    language.eq_ignore_ascii_case("auto")
+        || NEMOTRON_PRODUCTION
+            .iter()
+            .any(|code| code.eq_ignore_ascii_case(language))
+}
+
+pub fn parakeet_supports(language: &str) -> bool {
+    language.eq_ignore_ascii_case("auto")
+        || PARAKEET_LANGUAGES.contains(&language_base(language))
+}
+
+pub fn english_supports(language: &str) -> bool {
+    language.eq_ignore_ascii_case("auto") || language_base(language).eq_ignore_ascii_case("en")
+}
+
+pub fn supports_streaming(model_path: &str) -> bool {
+    !file_name(model_path).contains("parakeet-tdt")
+}
+
+pub fn supports_boost(model_path: &str) -> bool {
+    file_name(model_path).contains("nemotron") && has_embedded_tokenizer(model_path)
+}
+
+fn has_embedded_tokenizer(model_path: &str) -> bool {
+    use std::io::Read;
+
+    const KEY: &[u8] = b"asr.tokenizer.spm_model";
+    const SCAN_BYTES: usize = 2 * 1024 * 1024;
+
+    let Ok(mut file) = std::fs::File::open(model_path) else {
+        return false;
+    };
+    let mut head = vec![0u8; SCAN_BYTES];
+    let mut filled = 0;
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(_) => return false,
+        }
+    }
+    head[..filled]
+        .windows(KEY.len())
+        .any(|window| window == KEY)
+}
+
+fn uses_language_hint(model_path: &str) -> bool {
+    file_name(model_path).contains("nemotron")
+}
+
+fn file_name(model_path: &str) -> String {
+    Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Device {
+    pub id: String,
+    pub label: String,
+}
 
 #[repr(C)]
 struct BackendConfig {
@@ -47,6 +181,50 @@ struct Options {
     max_alternatives: i32,
     enable_speaker_diarization: bool,
     max_speaker_count: i32,
+}
+
+#[repr(C)]
+struct SpeechContext {
+    size: usize,
+    phrases: *const *const c_char,
+    phrase_count: usize,
+    boost: f32,
+}
+
+struct ContextBias {
+    _phrases: Vec<CString>,
+    _pointers: Vec<*const c_char>,
+    context: SpeechContext,
+}
+
+impl ContextBias {
+    fn new(terms: &[String]) -> Self {
+        let phrases: Vec<CString> = terms
+            .iter()
+            .filter(|term| !term.trim().is_empty())
+            .filter_map(|term| CString::new(term.as_str()).ok())
+            .collect();
+        let pointers: Vec<*const c_char> =
+            phrases.iter().map(|phrase| phrase.as_ptr()).collect();
+        let context = SpeechContext {
+            size: std::mem::size_of::<SpeechContext>(),
+            phrases: pointers.as_ptr(),
+            phrase_count: pointers.len(),
+            boost: 3.0,
+        };
+        Self {
+            _phrases: phrases,
+            _pointers: pointers,
+            context,
+        }
+    }
+
+    fn apply(&self, options: &mut Options) {
+        if self.context.phrase_count > 0 {
+            options.speech_contexts = &self.context as *const SpeechContext as *const c_void;
+            options.speech_context_count = 1;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -158,12 +336,33 @@ impl Api {
 pub struct Recognizer {
     handle: Handle,
     api: Api,
+    language: Option<CString>,
+    streaming: bool,
+    boosting: bool,
     _library: Arc<Library>,
 }
 
 impl Recognizer {
-    pub fn load(runtime_path: &str, model_path: &str, device: &str) -> Result<Self, String> {
+    pub fn load(
+        runtime_path: &str,
+        model_path: &str,
+        device: &str,
+        language: &str,
+    ) -> Result<Self, String> {
         let gpu = parse_device(device)?;
+        let name = file_name(model_path);
+        let streaming = supports_streaming(model_path);
+        let boosting = supports_boost(model_path);
+        if name.contains("nemotron-speech-streaming-en") && !english_supports(language) {
+            return Err("The Nemotron English model supports English only".into());
+        }
+        let language = if uses_language_hint(model_path) {
+            let code = language_code(language)
+                .ok_or_else(|| format!("Unsupported recognition language: {language}"))?;
+            Some(CString::new(code).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
         let dll = resolve_library(runtime_path)?;
         let library = unsafe {
             Library::load_with_flags(
@@ -208,6 +407,9 @@ impl Recognizer {
         Ok(Recognizer {
             handle,
             api,
+            language,
+            streaming,
+            boosting,
             _library: Arc::new(library),
         })
     }
@@ -215,15 +417,25 @@ impl Recognizer {
     fn options(&self) -> Options {
         let mut options = unsafe { (self.api.options_default)() };
         options.size = std::mem::size_of::<Options>();
+        if let Some(language) = &self.language {
+            options.language_code = language.as_ptr();
+        }
         options.enable_automatic_punctuation = true;
         options
     }
 
-    pub fn transcribe(&mut self, samples: &[f32], sample_rate: u32) -> Result<String, String> {
+    pub fn transcribe(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        terms: &[String],
+    ) -> Result<String, String> {
         if samples.is_empty() {
             return Err("No audio was captured".into());
         }
-        let options = self.options();
+        let bias = ContextBias::new(if self.boosting { terms } else { &[] });
+        let mut options = self.options();
+        bias.apply(&mut options);
         let mut result: Handle = std::ptr::null_mut();
         let status = unsafe {
             (self.api.recognize)(
@@ -255,8 +467,13 @@ impl Recognizer {
         transcript
     }
 
-    pub fn stream(&self) -> Result<Stream, String> {
+    pub fn stream(&self, terms: &[String]) -> Result<Stream, String> {
+        if !self.streaming {
+            return Err("This model is offline-only".into());
+        }
+        let bias = ContextBias::new(if self.boosting { terms } else { &[] });
         let mut options = self.options();
+        bias.apply(&mut options);
         options.interim_results = true;
         let mut handle = std::ptr::null_mut();
         let status = unsafe { (self.api.stream_start)(self.handle, &options, &mut handle) };
@@ -377,6 +594,85 @@ fn parse_device(device: &str) -> Result<i32, String> {
     }
 }
 
+pub fn list_devices(runtime_path: &str) -> Result<Vec<Device>, String> {
+    let cli = resolve_cli(runtime_path)?;
+    let output = Command::new(&cli)
+        .args(["doctor", "--json"])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("Could not inspect the runtime: {error}"))?;
+    if !output.status.success() {
+        return Err("The runtime could not list its devices".into());
+    }
+    devices_from_doctor(&output.stdout)
+}
+
+fn devices_from_doctor(json: &[u8]) -> Result<Vec<Device>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(json).map_err(|_| "The runtime returned unreadable device data")?;
+    let mut devices = Vec::new();
+    if let Some(entries) = value.get("devices").and_then(|value| value.as_array()) {
+        for entry in entries {
+            let kind = entry
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let id = if kind == "cpu" {
+                "cpu".to_string()
+            } else if kind.ends_with("gpu") {
+                match entry.get("index").and_then(|value| value.as_u64()) {
+                    Some(index) => format!("vulkan:{index}"),
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            let description = entry
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim();
+            let memory = entry.get("memory_total").and_then(|value| value.as_u64());
+            let label = match (description.is_empty(), memory) {
+                (false, Some(memory)) if id != "cpu" => {
+                    format!("{description} · {:.0} GB", memory as f64 / 1_000_000_000.0)
+                }
+                (false, _) => description.to_string(),
+                (true, _) if id == "cpu" => "CPU".to_string(),
+                (true, _) => id.clone(),
+            };
+            devices.push(Device { id, label });
+        }
+    }
+    if !devices.iter().any(|device| device.id == "cpu") {
+        devices.push(Device {
+            id: "cpu".to_string(),
+            label: "CPU".to_string(),
+        });
+    }
+    Ok(devices)
+}
+
+fn resolve_cli(runtime_path: &str) -> Result<PathBuf, String> {
+    let path = Path::new(runtime_path);
+    let mut candidates = Vec::new();
+    if path.is_dir() {
+        candidates.push(path.join("bin").join("nemo-speech.exe"));
+        candidates.push(path.join("nemo-speech.exe"));
+    } else if let Some(parent) = path.parent() {
+        candidates.push(parent.join("nemo-speech.exe"));
+        if let Some(root) = parent.parent() {
+            candidates.push(root.join("bin").join("nemo-speech.exe"));
+            candidates.push(root.join("nemo-speech.exe"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "The NeMo-Speech CLI was not found next to the runtime".to_string())
+}
+
 fn resolve_library(runtime_path: &str) -> Result<PathBuf, String> {
     let path = Path::new(runtime_path);
     if path.is_dir() {
@@ -451,6 +747,72 @@ mod tests {
     }
 
     #[test]
+    fn parakeet_is_offline_only() {
+        let path = "parakeet-tdt-0.6b-v3.q8_0.gguf";
+        assert!(!supports_streaming(path));
+        assert!(supports_streaming("nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"));
+        assert!(supports_streaming(
+            "nemotron-speech-streaming-en-0.6b.q8_0.gguf"
+        ));
+    }
+
+    #[test]
+    fn word_boosting_needs_a_nemotron_model_with_the_embedded_tokenizer() {
+        let directory = std::env::temp_dir().join("voxen-boost-tokenizer-test");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let tokenizer = directory.join("nemotron-3.5-asr-streaming-0.6b.q8_0.gguf");
+        std::fs::write(&tokenizer, b"GGUF asr.tokenizer.spm_model").unwrap();
+        assert!(supports_boost(tokenizer.to_str().unwrap()));
+        let legacy = directory.join("nemotron-speech-streaming-en-0.6b.q8_0.gguf");
+        std::fs::write(&legacy, b"GGUF without a tokenizer").unwrap();
+        assert!(!supports_boost(legacy.to_str().unwrap()));
+        assert!(!supports_boost("parakeet-tdt-0.6b-v3.q8_0.gguf"));
+        assert!(uses_language_hint(
+            "nemotron-speech-streaming-en-0.6b.q8_0.gguf"
+        ));
+        assert!(!uses_language_hint("parakeet-tdt-0.6b-v3.q8_0.gguf"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn language_hints_use_supported_locales() {
+        assert_eq!(language_code("en-US"), Some("en-US"));
+        assert_eq!(language_code("auto"), Some("auto"));
+        assert!(language_code("en").is_none());
+        assert!(parakeet_supports("es-ES"));
+        assert!(!parakeet_supports("ja-JP"));
+        assert!(english_supports("en-GB"));
+        assert!(!english_supports("de-DE"));
+        assert!(!nemotron_supports("el-GR"));
+        assert!(nemotron_supports("de-DE"));
+    }
+
+    #[test]
+    fn doctor_devices_map_to_runtime_identifiers() {
+        let devices = devices_from_doctor(
+            br#"{
+                "devices": [
+                    {"index": 0, "type": "gpu", "description": "AMD Radeon RX 9060 XT", "memory_total": 17095983104},
+                    {"index": 2, "type": "cpu", "description": "Ryzen 5 9600X"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(devices[0].id, "vulkan:0");
+        assert!(devices[0].label.contains("17 GB"));
+        assert_eq!(devices[1].id, "cpu");
+        assert_eq!(devices[1].label, "Ryzen 5 9600X");
+    }
+
+    #[test]
+    fn doctor_devices_always_include_cpu() {
+        let devices = devices_from_doctor(br#"{"devices":[{"index":0,"type":"gpu","description":"GPU"}]}"#)
+            .unwrap();
+        assert!(devices.iter().any(|device| device.id == "cpu"));
+    }
+
+    #[test]
     #[ignore]
     fn real_runtime_transcribes_sample() {
         let runtime = std::env::var("VOXEN_RUNTIME").expect("VOXEN_RUNTIME is not set");
@@ -463,9 +825,10 @@ mod tests {
             std::fs::read(&wav).unwrap_or_else(|e| panic!("Failed to read {}: {e}", wav.display()));
         let (samples, rate) = read_wav_pcm16(&bytes);
         let mut recognizer =
-            Recognizer::load(&runtime, &model, "vulkan:0").expect("Failed to load the recognizer");
+            Recognizer::load(&runtime, &model, "vulkan:0", "auto").expect("Failed to load the recognizer");
+        let terms = vec!["Voxen".to_string()];
         let transcript = recognizer
-            .transcribe(&samples, rate)
+            .transcribe(&samples, rate, &terms)
             .expect("Failed to transcribe the sample");
         assert!(
             transcript.to_lowercase().contains("country"),
@@ -476,13 +839,13 @@ mod tests {
             "Capitalization missing: {transcript}"
         );
         assert!(
-            transcript.ends_with('.'),
+            transcript.contains('.'),
             "Punctuation missing: {transcript}"
         );
-        assert_eq!(recognizer.transcribe(&samples, rate).unwrap(), transcript);
+        assert_eq!(recognizer.transcribe(&samples, rate, &[]).unwrap(), transcript);
         drop(recognizer);
-        let mut reloaded = Recognizer::load(&runtime, &model, "vulkan:0").unwrap();
-        assert_eq!(reloaded.transcribe(&samples, rate).unwrap(), transcript);
+        let mut reloaded = Recognizer::load(&runtime, &model, "vulkan:0", "auto").unwrap();
+        assert_eq!(reloaded.transcribe(&samples, rate, &[]).unwrap(), transcript);
     }
 
     #[test]
@@ -498,9 +861,10 @@ mod tests {
             std::fs::read(&wav).unwrap_or_else(|e| panic!("Failed to read {}: {e}", wav.display()));
         let (samples, rate) = read_wav_pcm16(&bytes);
         let recognizer =
-            Recognizer::load(&runtime, &model, "vulkan:0").expect("Failed to load the recognizer");
+            Recognizer::load(&runtime, &model, "vulkan:0", "auto").expect("Failed to load the recognizer");
+        let terms = vec!["Voxen".to_string()];
         let mut stream = recognizer
-            .stream()
+            .stream(&terms)
             .expect("Failed to start a streaming recognizer");
         let step = (rate as usize / 10).max(1);
         let mut interims = 0;

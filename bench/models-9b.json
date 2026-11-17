@@ -1,0 +1,10 @@
+{
+  "runtime": "C:\\Users\\isaac\\.lmstudio\\extensions\\backends\\llama.cpp-win-x86_64-vulkan-avx2-2.71.0\\llama-server.exe",
+  "root": "C:\\Users\\isaac\\.lmstudio\\models",
+  "models": [
+    {
+      "label": "qwen3.5-9b",
+      "file": "unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_S.gguf"
+    }
+  ]
+}

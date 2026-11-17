@@ -1,11 +1,15 @@
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voxen_lib::cleanup::{guard, Cleaner, Mode};
 
 const BENCH_PORT: u16 = 18241;
+const COLD_PORT: u16 = 18242;
 const MARKERS: [char; 8] = ['.', ',', '!', '?', ':', ';', '"', '\''];
 
 #[derive(Deserialize)]
@@ -58,6 +62,11 @@ struct Stats {
     caps: f64,
     over_edit: f64,
     extra: f64,
+    accepted_f1: f64,
+    accepted_punct: f64,
+    accepted_caps: f64,
+    fallback: bool,
+    word_match: bool,
     missing: Vec<String>,
     added: Vec<String>,
     median_ms: u128,
@@ -65,16 +74,21 @@ struct Stats {
     raw: String,
     expected: String,
     got: String,
+    accepted: String,
 }
 
 struct ModeReport {
     mode: Mode,
     stats: Vec<Stats>,
+    times: Vec<u128>,
 }
 
 struct ModelReport {
     label: String,
+    file_bytes: u64,
     cold_ms: u128,
+    cold_load_ms: Option<u128>,
+    server_rss_mib: Option<f64>,
     modes: Vec<ModeReport>,
 }
 
@@ -142,6 +156,12 @@ fn run_model(
     model: &Path,
     prompt: Option<&str>,
 ) -> Result<ModelReport, String> {
+    let file_bytes = std::fs::metadata(model).map(|meta| meta.len()).unwrap_or(0);
+    let cold_start = measure_cold_start(runtime, model);
+    let (cold_load_ms, server_rss_mib) = match cold_start {
+        Ok((ms, rss)) => (Some(ms), Some(rss)),
+        Err(_) => (None, None),
+    };
     let mut cleaner = Cleaner::load(runtime, &model.to_string_lossy())?;
     let cold = Instant::now();
     generate(&mut cleaner, &cases.cases[0].raw, options.modes[0], prompt)
@@ -151,6 +171,7 @@ fn run_model(
     let mut modes = Vec::new();
     for mode in &options.modes {
         let mut stats = Vec::new();
+        let mut all_times = Vec::new();
         for case in &cases.cases {
             let mut times = Vec::new();
             let mut text = String::new();
@@ -185,6 +206,11 @@ fn run_model(
                     caps: 0.0,
                     over_edit: 0.0,
                     extra: 0.0,
+                    accepted_f1: 0.0,
+                    accepted_punct: 0.0,
+                    accepted_caps: 0.0,
+                    fallback: true,
+                    word_match: false,
                     missing: Vec::new(),
                     added: Vec::new(),
                     median_ms: median(&times),
@@ -192,36 +218,39 @@ fn run_model(
                     raw: case.raw.clone(),
                     expected: case.expected.clone(),
                     got: String::new(),
+                    accepted: case.raw.clone(),
                 });
                 continue;
             }
             let guard_error = guard(&case.raw, &text).err();
-            let score = score(&case.expected, &text);
+            let raw_score = score(&case.expected, &text);
+            let fallback = guard_error.is_some();
+            let accepted = if fallback { case.raw.clone() } else { text.clone() };
+            let accepted_score = score(&case.expected, &accepted);
+            let word_match = raw_score.missing.is_empty() && raw_score.added.is_empty();
             let median_ms = median(&times);
+            all_times.extend(&times);
             println!(
-                "  [{}] {:<44} {:<10} f1 {:.2} over-edit {:.2} extra {:.2} punct {:.2} caps {:.2} {median_ms:>5} ms{}",
+                "  [{}] {:<44} {:<10} f1 {:.2} acc {:.2} over-edit {:.2} extra {:.2} punct {:.2} caps {:.2} {median_ms:>5} ms{}",
                 case.id,
                 case.name,
-                if guard_error.is_some() {
-                    "guard FAIL"
-                } else {
-                    "guard ok"
-                },
-                score.f1(),
-                score.over_edit(),
-                score.extra_rate(),
-                score.punct(),
-                score.caps(),
+                if fallback { "fallback" } else { "accepted" },
+                raw_score.f1(),
+                accepted_score.f1(),
+                raw_score.over_edit(),
+                raw_score.extra_rate(),
+                raw_score.punct(),
+                raw_score.caps(),
                 if unstable { "  UNSTABLE" } else { "" }
             );
             if let Some(reason) = &guard_error {
                 println!("       guard:    {reason}");
             }
-            if !score.missing.is_empty() {
-                println!("       dropped:  {}", quote_list(&score.missing));
+            if !raw_score.missing.is_empty() {
+                println!("       dropped:  {}", quote_list(&raw_score.missing));
             }
-            if !score.added.is_empty() {
-                println!("       added:    {}", quote_list(&score.added));
+            if !raw_score.added.is_empty() {
+                println!("       added:    {}", quote_list(&raw_score.added));
             }
             if text != case.expected {
                 println!("       expected: {}", case.expected);
@@ -232,30 +261,132 @@ fn run_model(
                 name: case.name.clone(),
                 guard_error,
                 error: false,
-                f1: score.f1(),
-                punct: score.punct(),
-                caps: score.caps(),
-                over_edit: score.over_edit(),
-                extra: score.extra_rate(),
-                missing: score.missing,
-                added: score.added,
+                f1: raw_score.f1(),
+                punct: raw_score.punct(),
+                caps: raw_score.caps(),
+                over_edit: raw_score.over_edit(),
+                extra: raw_score.extra_rate(),
+                accepted_f1: accepted_score.f1(),
+                accepted_punct: accepted_score.punct(),
+                accepted_caps: accepted_score.caps(),
+                fallback,
+                word_match,
+                missing: raw_score.missing,
+                added: raw_score.added,
                 median_ms,
                 unstable,
                 raw: case.raw.clone(),
                 expected: case.expected.clone(),
                 got: text,
+                accepted,
             });
         }
-        println!("  {}", aggregate_line(*mode, &stats));
-        modes.push(ModeReport { mode: *mode, stats });
+        println!("  {}", aggregate_line(*mode, &stats, &all_times));
+        modes.push(ModeReport { mode: *mode, stats, times: all_times });
     }
     cleaner.unload();
     println!();
     Ok(ModelReport {
         label: label.to_string(),
+        file_bytes,
         cold_ms,
+        cold_load_ms,
+        server_rss_mib,
         modes,
     })
+}
+
+fn measure_cold_start(runtime: &str, model: &Path) -> Result<(u128, f64), String> {
+    let mut command = Command::new(runtime);
+    command
+        .arg("-m")
+        .arg(model)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(COLD_PORT.to_string())
+        .arg("-c")
+        .arg("2048")
+        .arg("-t")
+        .arg(threads().to_string())
+        .arg("-rea")
+        .arg("off")
+        .arg("--no-webui")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let start = Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(90) {
+        match child.try_wait() {
+            Ok(None) => {}
+            _ => break,
+        }
+        if health_ok(COLD_PORT) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let elapsed = start.elapsed().as_millis();
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("cold load did not become ready".into());
+    }
+    let rss = process_rss_mib(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok((elapsed, rss))
+}
+
+fn health_ok(port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(1)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let request = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    raw.windows(4).any(|window| window == b"\"ok\"")
+}
+
+fn process_rss_mib(pid: u32) -> f64 {
+    let script = format!("(Get-Process -Id {pid}).WorkingSet64");
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .map(|bytes| bytes / 1_048_576.0)
+            .unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+fn threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .min(8)
 }
 
 fn generate(
@@ -272,43 +403,56 @@ fn generate(
 
 fn summarize(reports: &[ModelReport]) {
     println!(
-        "{:<18} {:<9} {:>7} {:>6} {:>10} {:>7} {:>6} {:>6} {:>8} {:>9}",
-        "model", "mode", "guard", "f1", "over-edit", "extra", "punct", "caps", "median", "cold"
+        "{:<18} {:<9} {:>7} {:>6} {:>6} {:>7} {:>7} {:>8} {:>7} {:>8} {:>7} {:>6}",
+        "model", "mode", "guard", "raw f1", "acc f1", "fallbk", "p50", "p95", "cold", "load", "rss", "size"
     );
     for report in reports {
         for entry in &report.modes {
             let passed = entry.stats.iter().filter(|stat| stat.guard_error.is_none()).count();
+            let fallbacks = entry.stats.iter().filter(|stat| stat.fallback).count();
             println!(
-                "{:<18} {:<9} {:>7} {:>6.2} {:>10.2} {:>7.2} {:>6.2} {:>6.2} {:>6} ms {:>7} ms",
+                "{:<18} {:<9} {:>7} {:>6.2} {:>6.2} {:>7} {:>6} ms {:>6} ms {:>6} ms {:>6} MiB {:>6} MiB {:>6.1} MiB",
                 report.label,
                 mode_name(entry.mode),
                 format!("{passed}/{}", entry.stats.len()),
                 mean(&entry.stats, |stat| stat.f1),
-                mean(&entry.stats, |stat| stat.over_edit),
-                mean(&entry.stats, |stat| stat.extra),
-                mean(&entry.stats, |stat| stat.punct),
-                mean(&entry.stats, |stat| stat.caps),
-                median(&entry.stats.iter().map(|stat| stat.median_ms).collect::<Vec<_>>()),
+                mean(&entry.stats, |stat| stat.accepted_f1),
+                format!("{fallbacks}/{}", entry.stats.len()),
+                percentile(&entry.times, 0.50),
+                percentile(&entry.times, 0.95),
                 report.cold_ms,
+                report.cold_load_ms.map_or("-".to_string(), |value| value.to_string()),
+                report.server_rss_mib.map_or("-".to_string(), |value| format!("{value:.0}")),
+                report.file_bytes as f64 / 1_048_576.0,
             );
         }
     }
 }
 
-fn aggregate_line(mode: Mode, stats: &[Stats]) -> String {
+fn aggregate_line(mode: Mode, stats: &[Stats], times: &[u128]) -> String {
     let passed = stats.iter().filter(|stat| stat.guard_error.is_none()).count();
+    let fallbacks = stats.iter().filter(|stat| stat.fallback).count();
     let unstable = stats.iter().filter(|stat| stat.unstable).count();
     let errors = stats.iter().filter(|stat| stat.error).count();
+    let word_matches = stats.iter().filter(|stat| stat.word_match).count();
     format!(
-        "{}: guard {passed}/{}, f1 {:.2}, over-edit {:.2}, extra {:.2}, punct {:.2}, caps {:.2}, median {} ms{}{}",
+        "{}: accepted {passed}/{}, raw f1 {:.2}, accepted f1 {:.2}, word match {word_matches}/{}, over-edit {:.2}, extra {:.2}, punct {:.2}, caps {:.2}, p50 {} ms, p95 {} ms{}{}{}",
         mode_name(mode),
         stats.len(),
         mean(stats, |stat| stat.f1),
+        mean(stats, |stat| stat.accepted_f1),
+        stats.len(),
         mean(stats, |stat| stat.over_edit),
         mean(stats, |stat| stat.extra),
         mean(stats, |stat| stat.punct),
         mean(stats, |stat| stat.caps),
-        median(&stats.iter().map(|stat| stat.median_ms).collect::<Vec<_>>()),
+        percentile(times, 0.50),
+        percentile(times, 0.95),
+        if fallbacks > 0 {
+            format!(", {fallbacks} fallback")
+        } else {
+            String::new()
+        },
         if errors > 0 {
             format!(", {errors} errored")
         } else {
@@ -358,15 +502,25 @@ fn write_report(
         "modes": options.modes.iter().map(|mode| mode_name(*mode)).collect::<Vec<_>>(),
         "models": reports.iter().map(|report| json!({
             "label": report.label,
+            "fileBytes": report.file_bytes,
             "coldMs": report.cold_ms,
+            "coldLoadMs": report.cold_load_ms,
+            "serverRssMiB": report.server_rss_mib,
             "modes": report.modes.iter().map(|entry| json!({
                 "mode": mode_name(entry.mode),
+                "p50Ms": percentile(&entry.times, 0.50),
+                "p95Ms": percentile(&entry.times, 0.95),
                 "cases": entry.stats.iter().map(|stat| json!({
                     "id": stat.id,
                     "name": stat.name,
                     "guard": stat.guard_error,
                     "error": stat.error,
                     "f1": stat.f1,
+                    "acceptedF1": stat.accepted_f1,
+                    "acceptedPunct": stat.accepted_punct,
+                    "acceptedCaps": stat.accepted_caps,
+                    "fallback": stat.fallback,
+                    "wordMatch": stat.word_match,
                     "overEdit": stat.over_edit,
                     "extra": stat.extra,
                     "punct": stat.punct,
@@ -378,6 +532,7 @@ fn write_report(
                     "raw": stat.raw,
                     "expected": stat.expected,
                     "got": stat.got,
+                    "accepted": stat.accepted,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
@@ -536,6 +691,16 @@ fn median(times: &[u128]) -> u128 {
     let mut sorted = times.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
+}
+
+fn percentile(times: &[u128], fraction: f64) -> u128 {
+    if times.is_empty() {
+        return 0;
+    }
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
 }
 
 fn mean(stats: &[Stats], value: impl Fn(&Stats) -> f64) -> f64 {

@@ -4,7 +4,7 @@ Voxen is a **local Windows dictation** desktop app. You hold or toggle a global 
 
 **Version:** 0.1.0
 **Stack:** Rust 2021, Rune 0.0.1 (pinned git revision `eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90`), single native Windows process
-**Recognizer:** NVIDIA Parakeet TDT v3 (0.6B) via [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) C ABI (`nemo_speech_asr_c.dll`)
+**Recognizer:** NVIDIA Nemotron 3.5 multilingual, Nemotron English, or Parakeet TDT v3 via [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) C ABI (`nemo_speech_asr_c.dll`)
 
 **Platform:** Windows only (insertion and NeMo bindings target Windows today).
 
@@ -51,7 +51,8 @@ Voxen is a **local Windows dictation** desktop app. You hold or toggle a global 
 | Streaming UI in other apps | No (live typing uses keystrokes, not app APIs) |
 | Installer or signed update artifacts | No (portable exe; see [Known limitations](#known-limitations)) |
 | Launch at login | Planned |
-| ASR vocabulary boosting | Planned |
+| Managed runtime and model library | Yes (download, progress, remove) |
+| Technical context word hints | Yes with Nemotron 3.5 (embedded tokenizer); no with Nemotron English or Parakeet |
 | macOS / Linux | Not supported |
 
 The **release milestone** is: shortcut → capture → local transcription → insertion. Everything in the “Planned” row is explicitly later work.
@@ -63,17 +64,12 @@ The **release milestone** is: shortcut → capture → local transcription → i
 ### First-time setup
 
 1. Download the latest `Voxen.exe` from GitHub releases and keep it anywhere you like. It is portable: there is no installer, and running it needs neither Node, WebView2, nor Rust.
-2. Download and extract the **NeMo-Speech.cpp** Windows Vulkan runtime (pinned to v0.2.0 in project docs). Keep all DLLs together. Dev layout: `runtime/nemo-speech-0.2.0-windows-x86_64-vulkan`.
-3. Pull the model once with the bundled CLI:
-   ```powershell
-   & './runtime/nemo-speech-0.2.0-windows-x86_64-vulkan/bin/nemo-speech.exe' pull parakeet-tdt
-   ```
-4. In Voxen **Settings**, set:
-   - **Runtime path** — SDK root or direct path to `nemo_speech_asr_c.dll`
-   - **Model path** — absolute path to the local `.gguf` file
-   - **Device** — e.g. `vulkan:0` for GPU, or `cpu`
-   - **Microphone** — optional; default uses system default input
-5. **Save changes**, then run through [Dictating into another app](#dictating-into-another-app) below to verify.
+2. Open **Settings → Model**. Choose a language and compute device, then download the official **NeMo-Speech.cpp v0.2.0 Vulkan** runtime and one model. Voxen verifies the archive or GGUF checksum and installs it under `%LOCALAPPDATA%\com.voxen.app\Cache`:
+   - **Nemotron 3.5 multilingual** streams live and supports 32 production locales.
+   - **Nemotron English** streams live and is English-only.
+   - **Parakeet TDT v3** covers 25 European languages but is offline-only: the transcript is inserted after you stop.
+3. Use **Test microphone**, say one sentence, and stop. The transcript stays in the sidebar; the Model tab marks the sample complete.
+4. If you already have a NeMo runtime, model, or a custom device string, use **Advanced manual setup** on the same tab. **Save changes** applies it.
 
 ### Dictating into another app
 
@@ -131,6 +127,9 @@ Fields (camelCase in JSON):
 | `cleanupMode` | `"raw"` \| `"light"` \| `"polished"` | `"raw"` | Post-transcription cleanup pass; `raw` skips it |
 | `cleanupRuntimePath` | string | `""` | `llama-server` binary or the folder containing it; required unless mode is `raw` |
 | `cleanupModelPath` | string | `""` | Small local instruction GGUF for cleanup; required unless mode is `raw` |
+| `language` | string | `"auto"` | Nemotron locale such as `en-US`; `auto` detects. Parakeet ignores this hint |
+| `contextMode` | `"off"` \| `"selection"` \| `"nearby"` | `"off"` | Read selected or caret-adjacent accessibility text for word hints and cleanup; word hints need the tokenizer-equipped Nemotron 3.5 GGUF |
+| `excludedApps` | string[] | `[]` | Executable names skipped before any context is read |
 
 Validation highlights:
 
@@ -242,10 +241,10 @@ There is no IPC event stream. `Engine::publish()` bumps a revision counter and w
 
 ## Live dictation
 
-During **recording**, Voxen tries to run NeMo’s **streaming** ASR in parallel with microphone capture:
+During **recording**, Voxen tries to run NeMo’s **streaming** ASR in parallel with microphone capture when the selected model supports it. Parakeet TDT is offline-only and skips straight to batch recognition:
 
-1. `start_recording` captures the foreground HWND (same rules as batch insertion: `0` when Voxen itself is focused), installs the keyboard submission observer when the target is non-zero, and asks the audio worker to open the microphone. Phase becomes `starting`.
-2. When the stream opens, a completion thread queues `InferenceCommand::StartLive` with the config, target HWND, and the session’s cancellation token; phase becomes `recording`.
+1. `start_recording` captures the foreground HWND (same rules as batch insertion: `0` when Voxen itself is focused), installs the keyboard submission observer when the target is non-zero, asks the audio worker to open the microphone, and reads optional technical context before publishing `starting` or showing the indicator. Phase becomes `starting`.
+2. When the stream opens, a completion thread queues `InferenceCommand::StartLive` with the config, target HWND, context terms, and the session’s cancellation token for streaming models; phase becomes `recording`.
 3. The audio worker forwards new mono samples to the inference thread every ~100 ms (`forward_audio` → `LiveAudio`).
 4. On the first chunk, the inference worker loads the model if needed and opens a `nemo::Stream`.
 5. Each `stream.push` is followed by `pump_live`, which reads interim/final hypotheses from `stream.next`.
@@ -278,6 +277,8 @@ Text appears live while speaking in every cleanup mode. After recording stops, V
 
 - **Cleanup runtime path** — `llama-server.exe` or its folder, e.g. the LM Studio backend folder `llama.cpp-win-x86_64-vulkan-avx2-2.51.0`
 - **Cleanup model path** — e.g. `Qwen3.5-2B-Q4_K_S.gguf`
+
+**Technical context (optional, off by default):** Voxen can read the focused control's explicitly selected text, or up to 400 characters either side of the caret when nothing is selected, through Windows UI Automation once at recording start, before the indicator appears and before any focus change. Context is bounded to 800 characters, read on a long-lived MTA worker through the `CUIAutomation8` client with 250 ms automation timeouts, and never uses screenshots or the clipboard. Password fields are detected on the focused element and its ancestors; an `edit` window with `ES_PASSWORD` is skipped. Executable names in **Excluded applications** are checked before any read. On the pinned Nemotron 3.5 GGUF, whose embedded SentencePiece tokenizer NVIDIA added in a re-converted checkpoint, the extracted technical terms are also passed as `speech_contexts` word hints. Voxen checks the GGUF for the embedded tokenizer key before reading context, so an older tokenizer-less 3.5 file also stays cleanup-only. The pinned Nemotron English GGUF has no embedded tokenizer and Parakeet TDT has no word boosting, so no accessibility read happens in Raw mode with either of them. With Light or Polished cleanup the same bounded text is added to the local cleanup prompt as a limited spelling and casing reference. The cleanup guard still preserves every transcript word, so it can adjust capitalization and punctuation but cannot replace a misspelled word or introduce a technical term. The English model still receives the language hint; Parakeet ignores it. If context is off, no accessibility read happens at all.
 
 **Safety guard:** every model reply passes an ordered lexical check before it replaces the transcript. Only clear um/uh deletions, narrow comma-delimited edge fillers (er/ah/basically), single-word adjacent same-sentence self-correction resolutions, punctuation/case changes, and numbered-list markers are allowed, and fillers may only be removed, never added; ambiguous phrases (you know, sort of, kind of, like), sentence-initial So, names (Ah, Er), conjunctions (and/or), negations, numbers, symbols, paths, and commands are preserved exactly, including hyphens, slashes, dots, and other symbols inside words. Any other added, dropped, or swapped word (added fillers, extra negations, changed numbers, swapped names or days, cross-sentence or trailing-cue corrections, truncation, hallucinations) rejects the reply. Rejected and failed cleanups keep the original transcript and show a warning in the settings preview (`Cleanup kept the original transcript: …`). Requests are bounded to 2000 input characters with a 30-second timeout; over-long or cut-off replies are rejected the same way.
 
@@ -520,9 +521,9 @@ Exported C symbols loaded from `nemo_speech_asr_c.dll` (see `nemo.rs`):
 | `nemo_speech_asr_options_default` | Punctuation-enabled options |
 | `nemo_speech_asr_last_error` | Error strings after failed calls |
 
-Model license: [CC-BY-4.0](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) for the pinned Parakeet model.
+Model licenses: [Nemotron 3.5](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) and [Nemotron English](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) under the NVIDIA Open Model License; [Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) under CC-BY-4.0. The managed runtime is Apache-2.0.
 
-**Pinned runtime:** NeMo-Speech.cpp **v0.2.0** Windows Vulkan x86_64. The CLI `nemo-speech.exe pull parakeet-tdt` downloads the matching GGUF (Q8 variant used in project verification).
+**Pinned runtime:** NeMo-Speech.cpp **v0.2.0** Windows Vulkan x86_64. Managed model URLs and checksums are pinned in `library.rs`; the Nemotron 3.5 entry points at NVIDIA's re-converted GGUF (`ea30d66`) that embeds the SentencePiece tokenizer required for word boosting, because the v0.2.0 and v0.3.0 `models/index.json` entries still reference the older tokenizer-less revision. The Parakeet entry is retained for offline recognition and existing installations.
 
 ---
 
@@ -598,7 +599,7 @@ There is no dev server or hot reload; rebuild and relaunch the native process.
 | Windows only | `windows` 0.58 (Win32 UI/input, clipboard, GDI, OLE, threading), `clipboard-win` 5 |
 | Build | `winres` 0.1 for the exe icon and version resource |
 
-External (not cargo): NeMo-Speech.cpp runtime DLLs and Parakeet GGUF on disk; optionally llama.cpp `llama-server` and a cleanup GGUF.
+External (not cargo): NeMo-Speech.cpp runtime DLLs and a Nemotron or Parakeet GGUF on disk; optionally llama.cpp `llama-server` and a cleanup GGUF.
 
 ### Native shell configuration
 
@@ -735,7 +736,10 @@ Documented verification (October 18, 2026) on the primary dev machine: Vulkan + 
 - **Paste-based batch fallback** — apps without standard Ctrl+V behavior may need future app-specific formatters.
 - **Live keystroke insertion** — revises text via backspace + Unicode typing; exotic inputs (vim, remote desktop, custom widgets) may not work reliably.
 - **Foreground capture** — focus must remain on the target through insertion for paste to succeed.
-- **NeMo DLL lifetime** — full native unload of DLLs is avoided; restart app after runtime updates.
+- **NeMo DLL lifetime** — full native unload of DLLs is avoided; restart app after runtime updates, and remove a managed runtime only after restarting Voxen.
+- **Parakeet is offline-only** — NeMo-Speech.cpp v0.2.0 rejects streaming for Parakeet TDT; Voxen skips live typing and inserts once after you stop. Parakeet also ignores language hints and word hints.
+- **Context needs TextPattern** — technical context is available only when the focused control exposes UI Automation `TextPattern`; controls without it yield no context. Password detection and excluded-app matching are best-effort and bounded by 250 ms automation timeouts. Word hints work only with the tokenizer-equipped Nemotron 3.5 GGUF; the pinned Nemotron English GGUF has no embedded tokenizer, and Parakeet TDT has no word boosting, so context is cleanup-only there.
+- **No download resume** — a managed runtime or model download restarts from zero if interrupted.
 - **Overlay placement** - the indicator is placed at the bottom-centre of the primary display by the app.
 - **Submission protection scope** — only physical Enter in the captured target window cancels; other send/submit shortcuts are not observed.
 
@@ -746,7 +750,6 @@ Documented verification (October 18, 2026) on the primary dev machine: Vulkan + 
 Not implemented yet; listed for context:
 
 - Launch at login
-- ASR vocabulary boosting
 - Persisted dictation history
 - Further streaming polish (non–text-field apps, latency tuning)
 - Application-specific formatting
@@ -760,7 +763,7 @@ Phrase replacements, the deterministic normalizer, offline local inference, and 
 
 | Term | Meaning |
 |------|---------|
-| ASR | Automatic speech recognition (Parakeet via NeMo-Speech.cpp) |
+| ASR | Automatic speech recognition (Nemotron or Parakeet via NeMo-Speech.cpp) |
 | Rune | Native Rust UI framework pinned to the git revision above; owns windows, GPU rendering, tray, shortcuts, and overlays |
 | Engine | Cloneable backend facade the settings UI calls for snapshots and actions |
 | NeMo runtime | Extracted `nemo-speech-*` SDK with `nemo_speech_asr_c.dll` and CLI |

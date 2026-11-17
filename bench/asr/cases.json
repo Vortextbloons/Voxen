@@ -1,0 +1,295 @@
+{
+  "cases": [
+    {
+      "id": "fleurs-1573",
+      "file": "fleurs-1573.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "A satellite phone is not generally a replacement for a mobile phone, as you have to be outdoors with clear line of sight to the satellite to make a phone call.",
+      "numbers": [],
+      "names": [],
+      "negations": [
+        "not"
+      ],
+      "note": "satellite phone negation",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1520",
+      "file": "fleurs-1520.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "Out of 1,400 people polled prior to the 2010 federal election, those who oppose Australia becoming a republic grew by 8 per cent since 2008.",
+      "numbers": [
+        "1,400",
+        "2010",
+        "8",
+        "2008"
+      ],
+      "names": [
+        "Australia"
+      ],
+      "negations": [],
+      "note": "numbers and country name",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1591",
+      "file": "fleurs-1591.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "Former House Speaker Newt Gingrich, Texas governor Rick Perry, and Congresswoman Michele Bachmann finished in fourth, fifth, and sixth place, respectively.",
+      "numbers": [
+        "fourth",
+        "fifth",
+        "sixth"
+      ],
+      "names": [
+        "Newt Gingrich",
+        "Rick Perry",
+        "Michele Bachmann",
+        "Texas"
+      ],
+      "negations": [],
+      "note": "politician names",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1643",
+      "file": "fleurs-1643.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "The park covers 19,500 km² and is divided in 14 different ecozones, each supporting different wildlife.",
+      "numbers": [
+        "19,500",
+        "14"
+      ],
+      "names": [],
+      "negations": [],
+      "note": "large number and unit",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1626",
+      "file": "fleurs-1626.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "The Olympic gold medalist was due to swim in the 100m and 200m freestyle and in three relays at the Commonwealth Games, but due to his complaints his fitness has been in doubt.",
+      "numbers": [
+        "100m",
+        "200m",
+        "three"
+      ],
+      "names": [
+        "Commonwealth Games"
+      ],
+      "negations": [],
+      "note": "distances and relays",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1650",
+      "file": "fleurs-1650.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "Saltwater Crocodiles do not actively live in the ocean, their primary habitat is in river estuaries north from Rockhampton.",
+      "numbers": [],
+      "names": [
+        "Rockhampton"
+      ],
+      "negations": [
+        "do not"
+      ],
+      "note": "crocodile negation",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1556",
+      "file": "fleurs-1556.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "His 1,000th stamp was the magnificent \"Great Deeds by Swedish Kings\" by David Klöcker Ehrenstrahl in 2000, which is listed in the Guinness Book of World Records.",
+      "numbers": [
+        "1,000th",
+        "2000"
+      ],
+      "names": [
+        "David Klöcker Ehrenstrahl",
+        "Guinness Book of World Records"
+      ],
+      "negations": [],
+      "note": "award name and years",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1518",
+      "file": "fleurs-1518.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "A former Filipino policeman has kept Hong Kong tourists hostage by hijacking their bus in Manila, the capital of the Philippines.",
+      "numbers": [],
+      "names": [
+        "Filipino",
+        "Hong Kong",
+        "Manila",
+        "Philippines"
+      ],
+      "negations": [],
+      "note": "place and nationality names",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1640",
+      "file": "fleurs-1640.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "On icy and snowy roadways, friction is low and you cannot drive as if you were on bare asphalt.",
+      "numbers": [],
+      "names": [],
+      "negations": [
+        "cannot"
+      ],
+      "note": "icy road negation",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1517",
+      "file": "fleurs-1517.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "Research in AI involves making machines to automate tasks that require intelligent behavior.",
+      "numbers": [],
+      "names": [],
+      "negations": [],
+      "note": "AI technical sentence",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1644",
+      "file": "fleurs-1644.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "When asked for comment, Miller said, \"Mike talks a lot during the hearing...I was getting ready so I wasn't really hearing what he was saying.\"",
+      "numbers": [],
+      "names": [
+        "Miller",
+        "Mike"
+      ],
+      "negations": [
+        "wasn't"
+      ],
+      "note": "quoted speech and negation",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1612",
+      "file": "fleurs-1612.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "Water is spilling over the levee in a section 100 feet wide.",
+      "numbers": [
+        "100"
+      ],
+      "names": [],
+      "negations": [],
+      "note": "levee measurement",
+      "punctuation_reference": true
+    },
+    {
+      "id": "librispeech-2277-149896-0008",
+      "file": "librispeech-2277-149896-0008.wav",
+      "source": "openslr/librispeech_asr clean validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "For some reason he felt as if something might come that way and was relieved when all the envelopes had been scanned and nothing suspicious noticed.",
+      "numbers": [],
+      "names": [],
+      "negations": [
+        "nothing"
+      ],
+      "note": "negation and long clause",
+      "punctuation_reference": false
+    },
+    {
+      "id": "librispeech-2277-149896-0026",
+      "file": "librispeech-2277-149896-0026.wav",
+      "source": "openslr/librispeech_asr clean validation (CC-BY-4.0)",
+      "kind": "real",
+      "transcript": "The long drizzle had begun pedestrians had turned up collars and trousers at the bottom.",
+      "numbers": [],
+      "names": [],
+      "negations": [],
+      "note": "street scene",
+      "punctuation_reference": false
+    },
+    {
+      "id": "jfk",
+      "file": "jfk.wav",
+      "source": "runtime/jfk.wav (public domain speech)",
+      "kind": "real",
+      "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "numbers": [],
+      "names": [
+        "Americans"
+      ],
+      "negations": [
+        "not"
+      ],
+      "note": "public-domain address excerpt",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1573-noise-12db",
+      "file": "fleurs-1573-noise-12db.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real+noise",
+      "transcript": "A satellite phone is not generally a replacement for a mobile phone, as you have to be outdoors with clear line of sight to the satellite to make a phone call.",
+      "numbers": [],
+      "names": [],
+      "negations": [
+        "not"
+      ],
+      "note": "satellite phone negation; white noise mixed at 12 dB SNR",
+      "punctuation_reference": true
+    },
+    {
+      "id": "fleurs-1650-noise-5db",
+      "file": "fleurs-1650-noise-5db.wav",
+      "source": "google/fleurs en_us validation (CC-BY-4.0)",
+      "kind": "real+noise",
+      "transcript": "Saltwater Crocodiles do not actively live in the ocean, their primary habitat is in river estuaries north from Rockhampton.",
+      "numbers": [],
+      "names": [
+        "Rockhampton"
+      ],
+      "negations": [
+        "do not"
+      ],
+      "note": "crocodile negation; white noise mixed at 5 dB SNR",
+      "punctuation_reference": true
+    },
+    {
+      "id": "silence-digital",
+      "file": "silence-digital.wav",
+      "source": "generated silence",
+      "kind": "silence",
+      "transcript": "",
+      "numbers": [],
+      "names": [],
+      "negations": [],
+      "note": "digital silence, hallucination probe",
+      "punctuation_reference": false
+    },
+    {
+      "id": "silence-noise-floor",
+      "file": "silence-noise-floor.wav",
+      "source": "generated low-level noise",
+      "kind": "silence",
+      "transcript": "",
+      "numbers": [],
+      "names": [],
+      "negations": [],
+      "note": "white noise at -60 dBFS, hallucination probe",
+      "punctuation_reference": false
+    }
+  ]
+}
