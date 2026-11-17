@@ -5,6 +5,8 @@ param(
     [switch]$KeepAlive
 )
 
+# Plain launch only: Rune's --native --trace submits a frame every display tick, so a traced run is not an idle measurement.
+
 $ErrorActionPreference = "Stop"
 
 function Get-Sample($process, [int]$seconds) {
@@ -42,7 +44,9 @@ function Wait-Ready($process, [int]$timeoutMs) {
 }
 
 $exeItem = Get-Item -LiteralPath $Exe
-$zip = Join-Path $exeItem.DirectoryName "Voxen_0.1.0_x64.zip"
+$zipItem = Get-ChildItem -LiteralPath $exeItem.DirectoryName -Filter "Voxen_*_x64.zip" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
 $process = Start-Process -FilePath $exeItem.FullName -PassThru
 try {
@@ -67,8 +71,8 @@ try {
         exe = $exeItem.FullName
         exeBytes = $exeItem.Length
         exeMiB = [math]::Round($exeItem.Length / 1MB, 2)
-        zipBytes = if (Test-Path $zip) { (Get-Item $zip).Length } else { $null }
-        zipMiB = if (Test-Path $zip) { [math]::Round((Get-Item $zip).Length / 1MB, 2) } else { $null }
+        zipBytes = if ($zipItem) { $zipItem.Length } else { $null }
+        zipMiB = if ($zipItem) { [math]::Round($zipItem.Length / 1MB, 2) } else { $null }
         startupReadyMs = $readyMs
         openIdleCpuPercent = $open.cpuPercent
         openWorkingSetMiB = $open.workingSetMiB
