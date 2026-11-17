@@ -1,7 +1,7 @@
 {
   "name": "voxen",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.4.0",
   "scripts": {
     "dev": "cargo run --manifest-path src-tauri/Cargo.toml",
     "build": "cargo build --release --manifest-path src-tauri/Cargo.toml",

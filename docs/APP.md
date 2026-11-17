@@ -2,7 +2,7 @@
 
 Voxen is a **local Windows dictation** desktop app. You hold or toggle a global shortcut, speak into the microphone, and the transcript is pasted into whatever application had focus when recording started. Audio and recognition stay on your machine: there is no transcription server, cloud API, or Python runtime.
 
-**Version:** 0.1.0
+**Version:** 0.4.0
 **Stack:** Rust 2021, Rune 0.0.1 (pinned git revision `eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90`), single native Windows process
 **Recognizer:** NVIDIA Nemotron 3.5 multilingual, Nemotron English, or Parakeet TDT v3 via [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) C ABI (`nemo_speech_asr_c.dll`)
 

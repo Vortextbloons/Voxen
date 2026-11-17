@@ -40,7 +40,9 @@ jobs:
           $content = $content -replace '(?m)^version = "[^"]+"', "version = `"$env:VERSION`""
           Set-Content -Path $path -Value $content -NoNewline
 
-      - run: cargo build --release --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - run: cargo build --locked --release --manifest-path src-tauri/Cargo.toml
 
       - shell: pwsh
         env:
@@ -62,7 +64,8 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: Voxen v${{ steps.version.outputs.version }}
-          body: Download Voxen.exe or the zip below. Voxen updates itself from the latest release. The updater is unsigned; Windows may warn about the downloaded executable.
+          body_path: CHANGELOG.md
+          make_latest: true
           files: |
             Voxen.exe
             Voxen_${{ steps.version.outputs.version }}_x64.zip
