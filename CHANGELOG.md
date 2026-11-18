@@ -1,29 +1,26 @@
-# Voxen v0.4.0
-
-## Added
-
-- Guided local setup with language selection, detected CPU/Vulkan devices, microphone testing, and sample dictation confirmation.
-- Managed model library with Nemotron 3.5 multilingual, Nemotron English, and Parakeet TDT v3; download progress, pinned SHA-256 verification, staged installation, removal, and model license/capability information.
-- Optional selected-text or caret-relative nearby Windows accessibility context, application exclusions, password-field protection, and an explicit off control.
-- Technical word hints with the tokenizer-equipped Nemotron 3.5 model; bounded local context for cleanup while preserving the existing word-change guard.
+# Voxen v0.5.0
 
 ## Changed
 
-- Native Rune desktop application replaces the previous Tauri interface.
-- Parakeet TDT v3 is explicitly batch-only with the pinned NeMo runtime; Nemotron supports streaming dictation.
-- Nemotron English and Parakeet context is cleanup-only because their managed models do not support technical word hints.
+- Voxen releases idle dictation resources sooner while it sits in the tray. The cleanup server may unload after about 20 seconds of tray idle, and the speech recognizer may unload after about 45 seconds. A shorter configured **Unload model after** delay still applies, and `0` keeps the recognizer resident.
+- Reopening Settings cancels a pending tray release. Closing the window during a recording or transcription waits for that session to finish before the tray timers start.
+- The recording indicator releases its GPU surface after 30 seconds hidden, while repeated dictation can reuse it.
+- Microphone startup and capture failures now end the session cleanly, surface the error, and resume the normal idle schedule.
+
+## Known issue
+
+- The renderer is intentionally unchanged in this release. The same build has intermittently used about one CPU core while idle on AMD systems; this is still under investigation.
+- No specific memory savings are claimed because no post-dictation RAM benchmark was run.
 
 ## Upgrading
 
-Download Voxen.exe or extract Voxen_0.4.0_x64.zip and run Voxen.exe on Windows x64.
+Download Voxen.exe or extract Voxen_0.5.0_x64.zip and run Voxen.exe on Windows x64.
 
-Automatic updates support Rune-to-Rune builds only. Tauri-to-Rune upgrades and automatic migration of Tauri settings are unsupported. Quit the old Tauri app, download the portable Rune build manually, and complete setup. No Tauri latest.json feed or signed Tauri updater artifacts are published.
-
-Existing Rune builds can use their in-app updater to replace the portable executable in place. Keep the executable in a writable location. Updates are unsigned; Windows may warn about the download.
+Existing Rune builds can use their in-app updater to replace the portable executable in place. Keep the executable in a writable location. Updates are unsigned; Windows may warn about the download. Tauri-to-Rune upgrades and automatic migration of Tauri settings remain unsupported.
 
 ## Known limitations
 
 - Runtime removal after loading requires restarting Voxen; model removal unloads the recognizer first.
 - Downloads restart after interruption rather than resuming.
 - Accessibility context availability varies by application; it has not been interactively validated across supported editors.
-- The complete in-app network installation flow still needs end-to-end verification. Artifact hashes, sizes, and real-runtime transcription/streaming were checked separately.
+- The complete in-app network installation flow still needs end-to-end verification.

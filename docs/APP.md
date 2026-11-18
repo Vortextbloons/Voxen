@@ -2,7 +2,7 @@
 
 Voxen is a **local Windows dictation** desktop app. You hold or toggle a global shortcut, speak into the microphone, and the transcript is pasted into whatever application had focus when recording started. Audio and recognition stay on your machine: there is no transcription server, cloud API, or Python runtime.
 
-**Version:** 0.4.0
+**Version:** 0.5.0
 **Stack:** Rust 2021, Rune 0.0.1 (pinned git revision `eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90`), single native Windows process
 **Recognizer:** NVIDIA Nemotron 3.5 multilingual, Nemotron English, or Parakeet TDT v3 via [NeMo-Speech.cpp](https://github.com/NVIDIA/NeMo-Speech.cpp) C ABI (`nemo_speech_asr_c.dll`)
 
@@ -626,7 +626,7 @@ Releases are built by GitHub Actions from `.github/workflows/release.yml`, which
 1. Bump `version` in `src-tauri/Cargo.toml` (the updater reads it; tag builds use the tag name, manual dispatches read `Cargo.toml`).
 2. Commit, then push a matching tag:
    ```powershell
-   git tag v0.2.0
+   git tag v0.5.0
    git push origin master --tags
    ```
 3. The workflow publishes the portable artifacts to the GitHub release.
@@ -752,6 +752,7 @@ Documented verification (October 18, 2026) on the primary dev machine: Vulkan + 
 - **Overlay placement** - the indicator is placed at the bottom-centre of the primary display by the app.
 - **Submission protection scope** — only physical Enter in the captured target window cancels; other send/submit shortcuts are not observed.
 - **Idle graphics** — Rune's Windows renderer starts on the CPU and normally initializes the GPU after the first frame. Rune's `RUNE_CPU_FIRST=only` diagnostic skips that initial GPU setup. Closing Settings releases the main window's GPU resources, and the indicator releases its surface after 30 seconds hidden. Rune can cache the overlay's GPU device for up to five minutes for reuse.
+- **Idle CPU on AMD** — the same build has intermittently used about one CPU core while idle on AMD systems; the renderer is intentionally unchanged in this release and the issue is still under investigation.
 
 ---
 

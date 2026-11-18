@@ -183,8 +183,8 @@ Dictation into the app that already has focus
 
 </div>
 
-## Version 0.4.0
+## Version 0.5.0
 
-See [CHANGELOG.md](CHANGELOG.md) for setup, model library, and technical context updates.
+See [CHANGELOG.md](CHANGELOG.md) for the idle resource release, update, and known-issue notes.
 
 Automatic updates support Rune-to-Rune builds only. Tauri-to-Rune upgrades and settings migration are unsupported. Users of the old Tauri app must quit it and download and run the portable Rune executable manually. The release does not publish a Tauri `latest.json` updater feed.
