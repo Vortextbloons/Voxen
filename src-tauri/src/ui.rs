@@ -280,6 +280,13 @@ impl VoxenApp {
 
     pub fn on_close(&mut self, _tx: &mut Tx) {
         self.end_shortcut_capture();
+        self.engine.window_closed();
+    }
+
+    pub fn on_visibility(&mut self, visible: bool, _tx: &mut Tx) {
+        if visible {
+            self.engine.window_shown();
+        }
     }
 
     pub fn on_shortcut(&mut self, _tx: &mut Tx) {

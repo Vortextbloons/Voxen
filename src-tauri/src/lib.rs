@@ -13,7 +13,8 @@ pub mod widgets;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rune::{
-    AppHandle, OverlayHandle, Shortcut, ShortcutId, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec,
+    AppHandle, OverlayHandle, OverlayOptions, Shortcut, ShortcutId, Tray, TrayEvent, TrayIcon,
+    TrayItem, TraySpec,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -132,6 +133,9 @@ pub struct Engine {
 
 type CapturedAudio = Result<(Vec<f32>, u32), String>;
 const DEFAULT_UNLOAD_SECONDS: u64 = 300;
+const TRAY_CLEANUP_SECONDS: u64 = 20;
+const TRAY_MODEL_SECONDS: u64 = 45;
+const OVERLAY_GPU_RELEASE_SECONDS: u64 = 30;
 const APP_ID: &str = "com.voxen.app";
 
 enum AudioCommand {
@@ -151,7 +155,9 @@ enum InferenceCommand {
     ),
     Unload,
     UnloadAck(mpsc::Sender<()>),
-    UnloadCleanup,
+    SessionEnded,
+    WindowClosed,
+    WindowShown,
     StartLive(Config, isize, Option<String>, Cancellation),
     LiveAudio(Vec<f32>, u32),
 }
@@ -166,6 +172,94 @@ struct Live {
     inserted: String,
     failure: Option<String>,
     cancellation: Cancellation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IdleDeadlines {
+    cleanup: Option<Instant>,
+    model: Option<Instant>,
+}
+
+impl IdleDeadlines {
+    fn next(self) -> Option<Instant> {
+        match (self.cleanup, self.model) {
+            (Some(cleanup), Some(model)) => Some(cleanup.min(model)),
+            (Some(cleanup), None) => Some(cleanup),
+            (None, Some(model)) => Some(model),
+            (None, None) => None,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+fn idle_deadlines(
+    now: Instant,
+    unload_after_seconds: u64,
+    model_loaded: bool,
+    cleanup_loaded: bool,
+    tray: bool,
+) -> IdleDeadlines {
+    let model_seconds = if model_loaded && unload_after_seconds > 0 {
+        Some(if tray {
+            unload_after_seconds.min(TRAY_MODEL_SECONDS)
+        } else {
+            unload_after_seconds
+        })
+    } else {
+        None
+    };
+    let cleanup_seconds = if cleanup_loaded {
+        Some(if tray {
+            model_seconds
+                .unwrap_or(TRAY_CLEANUP_SECONDS)
+                .min(TRAY_CLEANUP_SECONDS)
+        } else {
+            model_seconds.unwrap_or(DEFAULT_UNLOAD_SECONDS)
+        })
+    } else {
+        None
+    };
+    IdleDeadlines {
+        cleanup: cleanup_seconds.and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
+        model: model_seconds.and_then(|seconds| now.checked_add(Duration::from_secs(seconds))),
+    }
+}
+
+fn release_due(schedule: &mut IdleDeadlines, now: Instant) -> (bool, bool) {
+    let model = schedule.model.is_some_and(|at| at <= now);
+    let cleanup = schedule.cleanup.is_some_and(|at| at <= now);
+    if model {
+        schedule.model = None;
+    }
+    if cleanup {
+        schedule.cleanup = None;
+    }
+    (model, cleanup)
+}
+
+fn reschedule_idle(
+    engine: &Engine,
+    model_loaded: bool,
+    cleanup_loaded: bool,
+    tray: bool,
+) -> IdleDeadlines {
+    let unload_after_seconds = engine
+        .backend
+        .lock()
+        .unwrap()
+        .snapshot
+        .config
+        .unload_after_seconds;
+    idle_deadlines(
+        Instant::now(),
+        unload_after_seconds,
+        model_loaded,
+        cleanup_loaded,
+        tray,
+    )
 }
 
 pub fn default_config() -> Config {
@@ -491,7 +585,7 @@ impl Engine {
     }
 
     pub fn start_recording(&self) -> Result<(), String> {
-        let (config, foreground, receiver) = {
+        let (config, foreground, cancellation, receiver) = {
             let mut backend = self.backend.lock().unwrap();
             if !is_available(&backend.snapshot.phase) {
                 return Err("Dictation is already in progress".into());
@@ -531,13 +625,18 @@ impl Engine {
                     cancellation.finish();
                     error.to_string()
                 })?;
-            backend.cancellation = Some(cancellation);
+            backend.cancellation = Some(cancellation.clone());
             backend.submission = submission;
             backend.start_cancelled = false;
             backend.snapshot.phase = "starting".into();
             backend.snapshot.error = None;
             backend.snapshot.live_transcript = None;
-            (backend.snapshot.config.clone(), backend.foreground, rx)
+            (
+                backend.snapshot.config.clone(),
+                backend.foreground,
+                cancellation,
+                rx,
+            )
         };
         let context = if context_useful(&config) {
             context::capture(
@@ -550,11 +649,15 @@ impl Engine {
         };
         {
             let mut backend = self.backend.lock().unwrap();
-            backend.context = context;
+            if !cancellation.is_finished() {
+                backend.context = context;
+            }
         }
         self.publish();
         let engine = self.clone();
-        std::thread::spawn(move || complete_start(engine, config, foreground, receiver));
+        std::thread::spawn(move || {
+            complete_start(engine, config, foreground, cancellation, receiver)
+        });
         Ok(())
     }
 
@@ -594,6 +697,11 @@ impl Engine {
             Ok(job) => job,
             Err(error) => {
                 backend.finish_session();
+                backend.snapshot.phase = "error".into();
+                backend.snapshot.error = Some(error.clone());
+                let _ = backend.inference.send(InferenceCommand::SessionEnded);
+                drop(backend);
+                self.publish();
                 return Err(error);
             }
         };
@@ -689,6 +797,24 @@ impl Engine {
 
     pub fn hide_window(&self) {
         self.handle.hide();
+    }
+
+    pub fn window_closed(&self) {
+        let _ = self
+            .backend
+            .lock()
+            .unwrap()
+            .inference
+            .send(InferenceCommand::WindowClosed);
+    }
+
+    pub fn window_shown(&self) {
+        let _ = self
+            .backend
+            .lock()
+            .unwrap()
+            .inference
+            .send(InferenceCommand::WindowShown);
     }
 
     pub fn quit(&self) {
@@ -861,8 +987,14 @@ fn audio_worker(engine: Engine, receiver: mpsc::Receiver<AudioCommand>) {
                 if stream.take().is_some() {
                     samples.lock().unwrap().clear();
                     forwarded = 0;
-                    engine.backend.lock().unwrap().finish_session();
-                    engine.report_error(error);
+                    {
+                        let mut backend = engine.backend.lock().unwrap();
+                        backend.finish_session();
+                        backend.snapshot.phase = "error".into();
+                        backend.snapshot.error = Some(error);
+                        let _ = inference.send(InferenceCommand::SessionEnded);
+                    }
+                    engine.publish();
                 }
             }
             None => {
@@ -910,20 +1042,34 @@ fn append_mono(target: &Arc<Mutex<Vec<f32>>>, data: impl Iterator<Item = f32>, c
 fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) {
     let mut model: Option<nemo::Recognizer> = None;
     let mut cleaner: Option<cleanup::Cleaner> = None;
-    let mut deadline: Option<Instant> = None;
-    let mut unload_model_on_idle = false;
+    let mut schedule = IdleDeadlines::default();
+    let mut tray = false;
     let mut live: Option<Live> = None;
     loop {
-        let command = match deadline {
+        let command = match schedule.next() {
             Some(until) => {
                 match receiver.recv_timeout(until.saturating_duration_since(Instant::now())) {
                     Ok(command) => command,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if unload_model_on_idle {
-                            InferenceCommand::Unload
-                        } else {
-                            InferenceCommand::UnloadCleanup
+                        let busy = {
+                            let backend = engine.backend.lock().unwrap();
+                            !is_available(&backend.snapshot.phase)
+                        };
+                        if busy || live.is_some() {
+                            schedule =
+                                reschedule_idle(&engine, model.is_some(), cleaner.is_some(), tray);
+                            continue;
                         }
+                        let (model_due, cleanup_due) = release_due(&mut schedule, Instant::now());
+                        if model_due {
+                            model = None;
+                            engine.backend.lock().unwrap().snapshot.model_loaded = false;
+                            engine.publish();
+                        }
+                        if cleanup_due {
+                            cleaner = None;
+                        }
+                        continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -938,7 +1084,7 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                 live = None;
                 model = None;
                 cleaner = None;
-                deadline = None;
+                schedule.clear();
                 engine.backend.lock().unwrap().snapshot.model_loaded = false;
                 engine.publish();
             }
@@ -946,18 +1092,27 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                 live = None;
                 model = None;
                 cleaner = None;
-                deadline = None;
+                schedule.clear();
                 engine.backend.lock().unwrap().snapshot.model_loaded = false;
                 engine.publish();
                 let _ = reply.send(());
             }
-            InferenceCommand::UnloadCleanup => {
-                cleaner = None;
-                deadline = None;
+            InferenceCommand::SessionEnded => {
+                live = None;
+                schedule = reschedule_idle(&engine, model.is_some(), cleaner.is_some(), tray);
+            }
+            InferenceCommand::WindowClosed => {
+                tray = true;
+                schedule = reschedule_idle(&engine, model.is_some(), cleaner.is_some(), tray);
+            }
+            InferenceCommand::WindowShown => {
+                if std::mem::take(&mut tray) {
+                    schedule = reschedule_idle(&engine, model.is_some(), cleaner.is_some(), tray);
+                }
             }
             InferenceCommand::StartLive(config, target, context, cancellation) => {
                 live = None;
-                deadline = None;
+                schedule.clear();
                 match start_live(&engine, &mut model, &config, target, context, cancellation) {
                     Ok(session) => live = Some(session),
                     Err(error) => {
@@ -1071,17 +1226,7 @@ fn inference_worker(engine: Engine, receiver: mpsc::Receiver<InferenceCommand>) 
                     Ok::<(), String>(())
                 })();
                 engine.backend.lock().unwrap().finish_session();
-                unload_model_on_idle = config.unload_after_seconds > 0;
-                deadline = if model.is_some() && (unload_model_on_idle || cleaner.is_some()) {
-                    let idle = if unload_model_on_idle {
-                        config.unload_after_seconds
-                    } else {
-                        DEFAULT_UNLOAD_SECONDS
-                    };
-                    Instant::now().checked_add(Duration::from_secs(idle))
-                } else {
-                    None
-                };
+                schedule = reschedule_idle(&engine, model.is_some(), cleaner.is_some(), tray);
                 match result {
                     Ok(()) => {
                         {
@@ -1230,6 +1375,7 @@ fn complete_start(
     engine: Engine,
     config: Config,
     foreground: isize,
+    cancellation: Cancellation,
     receiver: mpsc::Receiver<Result<(), String>>,
 ) {
     let result = receiver
@@ -1239,24 +1385,26 @@ fn complete_start(
     let started = result.is_ok();
     {
         let mut backend = engine.backend.lock().unwrap();
+        if cancellation.is_finished() {
+            return;
+        }
         if started && backend.start_cancelled {
             let (tx, _rx) = mpsc::channel();
             let _ = backend.audio.send(AudioCommand::Stop(tx));
         }
         let completion = apply_start_completion(&mut backend, result);
         if completion == StartCompletion::Listening {
-            if let Some(cancellation) = backend.cancellation.clone() {
-                if nemo::supports_streaming(&config.model_path) {
-                    let _ = backend.inference.send(InferenceCommand::StartLive(
-                        config,
-                        foreground,
-                        backend.context.clone(),
-                        cancellation,
-                    ));
-                }
+            if nemo::supports_streaming(&config.model_path) {
+                let _ = backend.inference.send(InferenceCommand::StartLive(
+                    config,
+                    foreground,
+                    backend.context.clone(),
+                    cancellation,
+                ));
             }
         } else {
             backend.finish_session();
+            let _ = backend.inference.send(InferenceCommand::SessionEnded);
         }
     }
     engine.publish();
@@ -1435,6 +1583,7 @@ pub fn run() {
         .modifier_keys()
         .on_close(|state, tx| state.on_close(tx))
         .on_focus(|state, focused, tx| state.on_focus(focused, tx))
+        .on_visibility(|state, visible, tx| state.on_visibility(visible, tx))
         .on_quit(|state, _| state.engine.shutdown());
     let handle = app.handle();
     let engine = Engine::new(handle.clone());
@@ -1449,7 +1598,9 @@ pub fn run() {
                 inset: 0.0,
                 interactive: false,
                 view: indicator::view,
-            },
+            }
+            .options(OverlayOptions::default())
+            .release_gpu_after(Duration::from_secs(OVERLAY_GPU_RELEASE_SECONDS)),
             indicator::Indicator::new(),
         );
         engine.attach_indicator(indicator);
@@ -1539,6 +1690,77 @@ mod tests {
         assert!(!indicator_active("idle", false));
         assert!(indicator_active("starting", false));
         assert!(!indicator_active("starting", true));
+    }
+
+    #[test]
+    fn tray_idle_releases_cleanup_before_speech_and_honors_shorter_delays() {
+        let now = Instant::now();
+        let plan = idle_deadlines(now, 300, true, true, true);
+        assert_eq!(
+            plan.cleanup,
+            now.checked_add(Duration::from_secs(TRAY_CLEANUP_SECONDS))
+        );
+        assert_eq!(
+            plan.model,
+            now.checked_add(Duration::from_secs(TRAY_MODEL_SECONDS))
+        );
+        assert_eq!(plan.next(), plan.cleanup);
+
+        let plan = idle_deadlines(now, 30, true, true, true);
+        assert_eq!(
+            plan.cleanup,
+            now.checked_add(Duration::from_secs(TRAY_CLEANUP_SECONDS))
+        );
+        assert_eq!(plan.model, now.checked_add(Duration::from_secs(30)));
+
+        let plan = idle_deadlines(now, 10, true, true, true);
+        assert_eq!(plan.cleanup, now.checked_add(Duration::from_secs(10)));
+        assert_eq!(plan.model, now.checked_add(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn zero_unload_keeps_the_model_but_tray_still_releases_cleanup() {
+        let now = Instant::now();
+        let plan = idle_deadlines(now, 0, true, true, true);
+        assert_eq!(plan.model, None);
+        assert_eq!(
+            plan.cleanup,
+            now.checked_add(Duration::from_secs(TRAY_CLEANUP_SECONDS))
+        );
+
+        let plan = idle_deadlines(now, 0, true, true, false);
+        assert_eq!(plan.model, None);
+        assert_eq!(
+            plan.cleanup,
+            now.checked_add(Duration::from_secs(DEFAULT_UNLOAD_SECONDS))
+        );
+    }
+
+    #[test]
+    fn open_window_keeps_the_configured_idle_delay() {
+        let now = Instant::now();
+        let plan = idle_deadlines(now, 200, true, true, false);
+        assert_eq!(plan.model, now.checked_add(Duration::from_secs(200)));
+        assert_eq!(plan.cleanup, plan.model);
+    }
+
+    #[test]
+    fn idle_release_only_drops_resources_whose_deadline_passed() {
+        let now = Instant::now();
+        let mut plan = IdleDeadlines {
+            cleanup: now.checked_sub(Duration::from_secs(1)),
+            model: now.checked_add(Duration::from_secs(1)),
+        };
+        assert_eq!(release_due(&mut plan, now), (false, true));
+        assert_eq!(plan.cleanup, None);
+        assert_eq!(plan.model, now.checked_add(Duration::from_secs(1)));
+
+        let mut plan = IdleDeadlines {
+            cleanup: now.checked_sub(Duration::from_secs(1)),
+            model: now.checked_sub(Duration::from_secs(1)),
+        };
+        assert_eq!(release_due(&mut plan, now), (true, true));
+        assert_eq!(plan, IdleDeadlines::default());
     }
 
     fn backend_for_test() -> Backend {

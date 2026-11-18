@@ -84,6 +84,7 @@ The **release milestone** is: shortcut → capture → local transcription → i
 ### Settings window vs tray
 
 - Closing the settings window **ends shortcut capture** and leaves dictation running; Rune keeps the process, state, and tray alive (`keep_running`).
+- A closed window starts a short tray idle timer: the cleanup server is released after about 20 seconds, and the recognizer after about 45 seconds (or the configured delay if it is shorter). Setting `unloadAfterSeconds` to `0` still keeps the recognizer resident. Reopening settings cancels a pending tray release.
 - Tray menu: **Settings** (reopens settings), **Quit** (exits Voxen). Clicking the tray icon also opens settings.
 - Closing the window does not quit the process; use **Quit** from the tray (or finish an update, which quits to relaunch).
 
@@ -96,7 +97,8 @@ If you switch away before insertion completes, Voxen keeps the transcript and re
 ### Model memory
 
 - The recognizer can stay loaded between utterances for faster follow-up dictation.
-- **Unload model after** (seconds idle): set to `0` to keep the model resident; otherwise the inference thread unloads after the idle timeout.
+- **Unload model after** (seconds idle): set to `0` to keep the model resident; otherwise the inference thread unloads after the idle timeout while settings is open. In the tray the delay is capped at 45 seconds, and the cleanup server is released after 20 seconds even when the recognizer stays resident.
+- An in-flight recording or transcription keeps its recognizer until the session ends, even if settings closes during it; the tray timer starts when that session finishes.
 - **Unload model** button frees model memory immediately when idle.
 - NeMo 0.2.0 DLLs remain loaded until Voxen exits (unloading/reloading the native runtime caused failures during verification). Restart Voxen before replacing runtime DLLs on disk.
 
@@ -123,7 +125,7 @@ Fields (camelCase in JSON):
 | `modelPath` | string | `""` | Local GGUF model file |
 | `device` | string | `vulkan:0` | `cpu` or `vulkan:<index>` |
 | `replacements` | `{ from, to }[]` | `[]` | Literal substring replace on transcript (not regex); applied in array order; empty `from` rows are skipped at runtime but rejected on save |
-| `unloadAfterSeconds` | number | `300` | Idle unload delay; max 86400; `0` = never auto-unload |
+| `unloadAfterSeconds` | number | `300` | Idle unload delay while settings is open; max 86400; `0` = never auto-unload. In the tray the recognizer delay is capped at 45 seconds |
 | `cleanupMode` | `"raw"` \| `"light"` \| `"polished"` | `"raw"` | Post-transcription cleanup pass; `raw` skips it |
 | `cleanupRuntimePath` | string | `""` | `llama-server` binary or the folder containing it; required unless mode is `raw` |
 | `cleanupModelPath` | string | `""` | Small local instruction GGUF for cleanup; required unless mode is `raw` |
@@ -334,7 +336,7 @@ Global shortcut / settings "Test microphone"
 
 - **Rune UI thread:** settings view, input, global shortcut callbacks, tray callbacks, overlay updates, `poll`/`on_key` hooks, updater draining.
 - **Audio worker thread:** owns the cpal input stream; handles `Start` / `Stop` / stream errors.
-- **Inference worker thread:** owns optional `nemo::Recognizer`, optional live `Live` session, and optional `cleanup::Cleaner`; handles `StartLive`, `LiveAudio`, `Transcribe`, `Unload`, and `UnloadCleanup`; implements the idle unload deadline.
+- **Inference worker thread:** owns optional `nemo::Recognizer`, optional live `Live` session, and optional `cleanup::Cleaner`; handles `StartLive`, `LiveAudio`, `Transcribe`, `SessionEnded`, `WindowClosed`, `WindowShown`, and `Unload`; implements the independent cleanup/recognizer idle deadlines.
 - **Keyboard observer thread:** installed per recording with a non-zero target; runs a low-level keyboard hook and cancels the session on a physical Enter. Dropped when the session ends.
 - **Start completion thread:** waits for the audio worker's start reply, then sets `recording` or `error` and queues `StartLive`.
 - **Updater workers:** one short-lived thread per GitHub check or install.
@@ -362,27 +364,29 @@ While a stream is active, the audio worker wakes every **100 ms** (recv timeout)
 | `StartLive` | `Config`, foreground HWND, `Cancellation` | Load model if needed, open `nemo::Stream`, reset live session |
 | `LiveAudio` | `Vec<f32>`, sample rate | `stream.push` + `pump_live` when a session exists |
 | `Transcribe` | `Config`, samples, rate, HWND, `Cancellation` | Finish live stream **or** batch transcribe + optional `insert_text` |
-| `Unload` | — | Drop live session, recognizer, and cleanup server; clear idle deadline; `modelLoaded = false` |
-| `UnloadCleanup` | — | Drop only the cleanup server and its deadline |
+| `SessionEnded` | — | End an aborted or capture-failed session, drop its live stream, and resume idle deadlines |
+| `WindowClosed` | — | Enter tray idle policy and schedule the short tray deadlines |
+| `WindowShown` | — | Leave tray idle policy and restore configured open-window deadlines |
+| `Unload` | — | Drop live session, recognizer, and cleanup server; clear idle deadlines; `modelLoaded = false` |
 
-After a successful `Transcribe`, if `unload_after_seconds > 0` and a model remains loaded, the worker sets a recv timeout to `Unload` when idle time elapses. Otherwise a loaded cleanup server gets the default 300-second `UnloadCleanup` deadline.
+After `Transcribe`, the worker schedules cleanup and recognizer release independently. With Settings open, both use the configured delay. A delay of zero keeps the recognizer resident and gives cleanup a 300-second limit. In the tray, the cleanup delay is capped at 20 seconds and the recognizer delay at 45 seconds. Active sessions defer both deadlines.
 
 ### Application lifecycle
 
 **Startup (`run` in `lib.rs`):**
 
 1. Set the Rune app id (`com.voxen.app`) and app icon.
-2. Build the Rune app: 900×680 window, 720×520 minimum, `poll` and `on_key` hooks, `keep_running`, unmodified shortcuts allowed, and close/focus/quit callbacks.
+2. Build the Rune app: 900×680 window, 720×520 minimum, `poll` and `on_key` hooks, `keep_running`, unmodified shortcuts allowed, and close/focus/visibility/quit callbacks.
 3. Create `Engine`, which loads `config.json` and spawns the audio and inference workers.
-4. Create the indicator overlay (`220×76`, bottom edge, centred, 40 pt margin, non-interactive).
+4. Create the indicator overlay (`220×76`, bottom edge, centred, 40 pt margin, non-interactive); it releases its GPU surface after 30 seconds hidden.
 5. Start the tray with **Settings** and **Quit**; tooltip: `Voxen — local dictation`.
 6. Register the saved global shortcut on the UI thread; registration failure surfaces as `error`.
 7. Build `ui::VoxenApp` from the `Engine` and run the app.
 
 **While running:**
 
-- Closing the settings window ends shortcut capture and keeps the process, state, and tray alive (`keep_running`). **Settings** from the tray (or clicking the tray icon) shows and focuses the window again.
-- Dictation keeps running while the window is closed.
+- Closing the settings window ends shortcut capture, starts the tray idle policy, and keeps the process, state, and tray alive (`keep_running`). **Settings** from the tray (or clicking the tray icon) shows and focuses the window again and restores the open-window idle policy.
+- Dictation keeps running while the window is closed. Closing during recording or transcription defers the tray idle timers until that session ends.
 - The indicator overlay is shown for `starting` (unless the start was cancelled), `recording`, `transcribing`, and `inserting`, and hidden otherwise.
 - Tray **Quit** calls `AppHandle::quit`; the `on_quit` hook sends `Unload` and waits up to 300 ms for worker shutdown.
 - When the updater reports `Ready`, `VoxenApp::poll` calls `tx.quit()` so the swap helper can replace the executable after the process exits.
@@ -418,7 +422,7 @@ The settings UI is native Rune code, not HTML:
 
 `VoxenApp` shows the phase and model-loaded state, live and last transcript previews, **Test microphone**, microphone selection, activation mode and shortcut capture, model paths/device/idle unload and **Unload model**, cleanup mode and paths, replacement rows, update check/install, and a save action. Draft edits are local until saved; each Engine call refreshes the snapshot.
 
-`poll` drains the updater, keeps hold-mode working by checking `Engine::shortcut_down()` every ~40 ms while `starting`/`recording`, and reports whether visible state changed. `on_key` implements shortcut capture; `on_shortcut` forwards to `Engine::handle_shortcut`; `on_close` and focus loss end capture.
+`poll` drains the updater, keeps hold-mode working by checking `Engine::shortcut_down()` every ~40 ms while `starting`/`recording`, and reports whether visible state changed. `on_key` implements shortcut capture; `on_shortcut` forwards to `Engine::handle_shortcut`; `on_close` and focus loss end capture, and `on_close` starts the tray idle policy. `on_visibility(true)` restores the open-window idle policy after a reopen.
 
 ### Indicator overlay
 
@@ -428,6 +432,7 @@ A Rune edge overlay (`OverlaySpec`) created at startup:
 - **Hidden** when phase is `idle` or `error`.
 - **Labels:** `Starting`, `Listening...`, `Transcribing`, `Inserting`; `Error` in red when the overlay is updated with an error.
 - **Motion:** a soft glow around the dot pulses only while `recording`.
+- **Graphics:** the overlay releases its GPU surface after 30 seconds hidden, so repeated dictation reuses it but an idle tray app does not retain it.
 
 ### Native modules (Rust)
 
@@ -606,9 +611,9 @@ External (not cargo): NeMo-Speech.cpp runtime DLLs and a Nemotron or Parakeet GG
 - App ID: `com.voxen.app`
 - Main window: 900×680, minimum 720×520
 - Tray icon decoded from `src-tauri/icons/icon.png`; exe icon from `icons/icon.ico` via `winres`
-- Process keeps running when the window closes (`keep_running`)
+- Process keeps running when the window closes (`keep_running`); closing releases the window GPU and starts the tray idle policy
 - Unmodified global shortcuts allowed
-- Indicator overlay: 220×76, bottom edge, centred, 40 pt margin, non-interactive
+- Indicator overlay: 220×76, bottom edge, centred, 40 pt margin, non-interactive; GPU surface released after 30 seconds hidden
 
 ### Releases and updates
 
@@ -655,6 +660,10 @@ See [AGENTS.md](../AGENTS.md) for editing principles and [RUNE_UI_CONTRACT.md](R
 | `cleanup_requires_a_mode_and_both_paths` | `lib.rs` | Cleanup only runs with a non-raw mode and both paths |
 | `selecting_a_cleanup_mode_requires_cleanup_paths` | `lib.rs` | Saved non-raw mode without paths is rejected |
 | `indicator_visibility_follows_the_phase` | `lib.rs` | Indicator shows for starting/recording/transcribing, hides when a start is cancelled |
+| `tray_idle_releases_cleanup_before_speech_and_honors_shorter_delays` | `lib.rs` | Tray deadlines are 20 s cleanup / 45 s speech, shortened by a smaller configured delay |
+| `zero_unload_keeps_the_model_but_tray_still_releases_cleanup` | `lib.rs` | `unloadAfterSeconds = 0` keeps the recognizer but still releases cleanup in the tray |
+| `open_window_keeps_the_configured_idle_delay` | `lib.rs` | Settings open keeps the configured recognizer and cleanup delay |
+| `idle_release_only_drops_resources_whose_deadline_passed` | `lib.rs` | Cleanup and recognizer deadlines fire independently |
 | `live_edits_only_replace_the_changed_suffix` | `insertion.rs` | Common-prefix logic for live typing |
 | `live_edits_keep_whole_surrogate_pairs` | `insertion.rs` | Unicode surrogate-safe backspace boundaries |
 | `cancelled_sessions_never_touch_the_target_window` | `insertion.rs` | Cancelled insert/replace calls are no-ops |
@@ -742,6 +751,7 @@ Documented verification (October 18, 2026) on the primary dev machine: Vulkan + 
 - **No download resume** — a managed runtime or model download restarts from zero if interrupted.
 - **Overlay placement** - the indicator is placed at the bottom-centre of the primary display by the app.
 - **Submission protection scope** — only physical Enter in the captured target window cancels; other send/submit shortcuts are not observed.
+- **Idle graphics** — Rune's Windows renderer starts on the CPU and normally initializes the GPU after the first frame. Rune's `RUNE_CPU_FIRST=only` diagnostic skips that initial GPU setup. Closing Settings releases the main window's GPU resources, and the indicator releases its surface after 30 seconds hidden. Rune can cache the overlay's GPU device for up to five minutes for reuse.
 
 ---
 
